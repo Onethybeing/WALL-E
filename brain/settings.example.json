@@ -1,0 +1,7 @@
+{
+  "llm_provider": "gemini",
+  "llm_api_key": "YOUR_GEMINI_API_KEY_HERE",
+  "llm_model": "gemini-3.5-flash-lite",
+  "voice_provider": "gemini",
+  "voice_api_key": "YOUR_GEMINI_API_KEY_HERE"
+}

@@ -1,0 +1,19 @@
+# Python brain
+brain/.env
+brain/settings.json
+brain/memory.db
+brain/__pycache__/
+brain/*.pyc
+
+# Flutter app build artifacts (app/ has its own .gitignore for app-specific rules)
+app/build/
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/android/.gradle/
+app/android/local.properties
+app/*.iml
+
+# OS noise
+.DS_Store
+Thumbs.db

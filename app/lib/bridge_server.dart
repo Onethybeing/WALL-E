@@ -1,0 +1,87 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:camera/camera.dart';
+import 'package:geolocator/geolocator.dart';
+
+/// A tiny local HTTP server so the Python brain (running in Termux on the
+/// same phone) can ask the Flutter app to take a photo or get a GPS fix.
+///
+/// This exists because Termux:API's own Camera and Location commands are
+/// broken on a sideloaded (non-Play-Store) install -- see tools.py's
+/// analyze_photo/get_location docstrings. Since this is all loopback
+/// (127.0.0.1), it also completely sidesteps the mobile-hotspot client
+/// isolation that broke wireless adb -- nothing here leaves the device.
+class BridgeServer {
+  static const int port = 8099;
+
+  HttpServer? _server;
+
+  Future<void> start() async {
+    _server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
+    _server!.listen(_handleRequest);
+  }
+
+  Future<void> _handleRequest(HttpRequest request) async {
+    try {
+      if (request.uri.path == '/location') {
+        await _handleLocation(request);
+      } else if (request.uri.path == '/photo') {
+        await _handlePhoto(request);
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+      }
+    } catch (e) {
+      request.response.statusCode = HttpStatus.internalServerError;
+      request.response.write('error: $e');
+      await request.response.close();
+    }
+  }
+
+  Future<void> _handleLocation(HttpRequest request) async {
+    final permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      await Geolocator.requestPermission();
+    }
+    final position = await Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.medium),
+    );
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode({
+      'latitude': position.latitude,
+      'longitude': position.longitude,
+      'accuracy': position.accuracy,
+    }));
+    await request.response.close();
+  }
+
+  Future<void> _handlePhoto(HttpRequest request) async {
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) {
+      request.response.statusCode = HttpStatus.serviceUnavailable;
+      await request.response.close();
+      return;
+    }
+    final back = cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras.first,
+    );
+    // A dedicated controller for the still photo, separate from the one
+    // face_tracking.dart keeps running for the front-camera live stream.
+    final controller = CameraController(back, ResolutionPreset.medium, enableAudio: false);
+    await controller.initialize();
+    final file = await controller.takePicture();
+    final bytes = await file.readAsBytes();
+    await controller.dispose();
+
+    request.response.headers.contentType = ContentType('image', 'jpeg');
+    request.response.add(bytes);
+    await request.response.close();
+  }
+
+  Future<void> stop() async {
+    await _server?.close(force: true);
+    _server = null;
+  }
+}
