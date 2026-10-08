@@ -17,6 +17,7 @@ import re
 import sys
 
 import memory
+import mood_bridge
 import skills
 import tools
 from llm import get_llm_client
@@ -100,31 +101,37 @@ def run_turn(client, history: list[dict], user_message: str) -> str:
     history.append({"role": "user", "content": user_message})
     messages = [{"role": "system", "content": build_system_prompt()}] + history
 
-    for _ in range(MAX_TOOL_HOPS):
-        try:
-            reply = client.chat(messages)
-        except Exception as e:
-            # A transient API error (network blip, rate limit, bad key) should
-            # not kill the whole pet process -- report it and keep history
-            # consistent (every user turn gets a matching assistant turn).
-            reply = f"(trouble reaching the model: {e})"
-            history.append({"role": "assistant", "content": reply})
-            return reply
+    try:
+        for _ in range(MAX_TOOL_HOPS):
+            mood_bridge.set_mood("thinking")
+            try:
+                reply = client.chat(messages)
+            except Exception as e:
+                # A transient API error (network blip, rate limit, bad key) should
+                # not kill the whole pet process -- report it and keep history
+                # consistent (every user turn gets a matching assistant turn).
+                reply = f"(trouble reaching the model: {e})"
+                history.append({"role": "assistant", "content": reply})
+                return reply
 
-        call = extract_tool_call(reply)
-        if call is None:
-            history.append({"role": "assistant", "content": reply})
-            return reply
+            call = extract_tool_call(reply)
+            if call is None:
+                history.append({"role": "assistant", "content": reply})
+                return reply
 
-        tool_result = run_tool_call(call)
-        messages.append({"role": "assistant", "content": reply})
-        messages.append(
-            {"role": "user", "content": f"<tool_response>{tool_result}</tool_response>"}
-        )
+            tool_result = run_tool_call(call)
+            messages.append({"role": "assistant", "content": reply})
+            messages.append(
+                {"role": "user", "content": f"<tool_response>{tool_result}</tool_response>"}
+            )
 
-    giveup_reply = "(gave up after too many tool calls in a row)"
-    history.append({"role": "assistant", "content": giveup_reply})
-    return giveup_reply
+        giveup_reply = "(gave up after too many tool calls in a row)"
+        history.append({"role": "assistant", "content": giveup_reply})
+        return giveup_reply
+    finally:
+        # Whatever happened above (answer, error, giveup), the eyes should
+        # settle back to idle once this turn is done.
+        mood_bridge.set_mood("idle")
 
 
 def main():

@@ -1,14 +1,16 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:rive/rive.dart';
 
 import 'bridge_server.dart';
 import 'face_tracking.dart';
-// Wake-word is temporarily disabled -- see pubspec.yaml and wake_word.dart
-// for why (an upstream dependency conflict, not our code).
-// import 'wake_word.dart';
+import 'rive_eyes.dart';
+import 'wake_word.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await RiveFile.initialize();
   // Lock the app to landscape since the eyes are designed for a wide screen.
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
@@ -30,9 +32,35 @@ class WallEApp extends StatelessWidget {
   }
 }
 
-/// The pet's current expression. Later this gets driven by the agent's state
-/// (listening / thinking / speaking) instead of the tap-to-cycle demo below.
-enum Mood { idle, happy, surprised, thinking }
+/// The pet's current expression. `idle`/`happy`/`surprised`/`thinking` are
+/// driven by the tap-to-cycle demo; `searching`/`speaking`/`takingPhoto` are
+/// driven for real by the brain via BridgeServer.moodNotifier (see
+/// _EyesScreenState's bridge listener below and brain/mood_bridge.py on the
+/// Python side).
+enum Mood { idle, happy, surprised, thinking, searching, speaking, takingPhoto }
+
+/// Maps the state strings the brain POSTs to /mood (brain/mood_bridge.py's
+/// VALID_STATES) onto the Mood enum above. Keep both lists in sync.
+Mood? _moodFromBrainState(String state) => switch (state) {
+      'idle' => Mood.idle,
+      'thinking' => Mood.thinking,
+      'searching' => Mood.searching,
+      'speaking' => Mood.speaking,
+      'taking_photo' => Mood.takingPhoto,
+      _ => null,
+    };
+
+/// A short label + accent color for each mood, used by the overlay in
+/// _EyesScreenState.build() -- the Rive rig itself has no mood animations
+/// (it's purely an eye-tracking rig), so mood is communicated via this
+/// overlay rather than by changing the eyes' own artwork.
+({String label, Color color})? _overlayFor(Mood mood) => switch (mood) {
+      Mood.thinking => (label: 'thinking...', color: Colors.purpleAccent),
+      Mood.searching => (label: 'searching...', color: Colors.yellowAccent),
+      Mood.speaking => (label: 'speaking...', color: Colors.greenAccent),
+      Mood.takingPhoto => (label: 'taking a photo...', color: Colors.orangeAccent),
+      _ => null,
+    };
 
 /// The main screen: a black background with two animated eyes centered on it.
 class EyesScreen extends StatefulWidget {
@@ -64,7 +92,7 @@ class _EyesScreenState extends State<EyesScreen>
 
   final BridgeServer _bridgeServer = BridgeServer();
 
-  // WakeWordListener? _wakeWordListener; // disabled -- see pubspec.yaml
+  WakeWordListener? _wakeWordListener;
 
   final Random _random = Random();
 
@@ -79,7 +107,27 @@ class _EyesScreenState extends State<EyesScreen>
     _controller.repeat();
     _setUpLookBehaviour();
     _bridgeServer.start();
-    // Wake-word setup disabled for now -- see pubspec.yaml for why.
+    _bridgeServer.moodNotifier.addListener(_onBrainMoodChanged);
+    _setUpWakeWord();
+  }
+
+  void _onBrainMoodChanged() {
+    final mood = _moodFromBrainState(_bridgeServer.moodNotifier.value);
+    if (mood != null && mounted) {
+      setState(() => _mood = mood);
+    }
+  }
+
+  void _setUpWakeWord() {
+    _wakeWordListener = WakeWordListener(
+      onWake: () {
+        // Surface that we heard the wake word by snapping to the "thinking"
+        // expression -- the real brain hookup (actually starting mic_listen
+        // on the phone) lands with the eyes<->brain bridge.
+        if (mounted) setState(() => _mood = Mood.thinking);
+      },
+    );
+    _wakeWordListener!.start();
   }
 
   void _setUpLookBehaviour() {
@@ -157,27 +205,60 @@ class _EyesScreenState extends State<EyesScreen>
   void dispose() {
     _controller.dispose();
     _faceTracker?.stop();
+    _bridgeServer.moodNotifier.removeListener(_onBrainMoodChanged);
     _bridgeServer.stop();
+    _wakeWordListener?.stop();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final overlay = _overlayFor(_mood);
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
         // Tap-to-cycle is a stand-in until the agent's own state drives mood.
         onTap: _cycleMood,
         behavior: HitTestBehavior.opaque,
-        child: Center(
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Eye(blink: _blink, lookOffset: _lookOffset, mood: _mood),
-              const SizedBox(width: 48),
-              Eye(blink: _blink, lookOffset: _lookOffset, mood: _mood),
-            ],
-          ),
+        child: Stack(
+          children: [
+            SizedBox.expand(
+              child: RiveEyes(lookOffset: _lookOffset),
+            ),
+            if (overlay != null)
+              IgnorePointer(
+                child: Stack(
+                  children: [
+                    // A colored border glow around the whole screen -- cheap,
+                    // visible from across a room, and doesn't require the
+                    // Rive rig itself to support mood animations.
+                    Positioned.fill(
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
+                        decoration: BoxDecoration(
+                          border: Border.all(color: overlay.color, width: 6),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 24,
+                      left: 0,
+                      right: 0,
+                      child: Center(
+                        child: Text(
+                          overlay.label,
+                          style: TextStyle(
+                            color: overlay.color,
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
         ),
       ),
     );

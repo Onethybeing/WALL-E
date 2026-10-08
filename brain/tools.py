@@ -18,6 +18,7 @@ import requests
 import json
 
 import memory
+import mood_bridge
 import skills
 import vision
 import voice
@@ -52,6 +53,7 @@ def web_search(query: str) -> str:
     Deliberately lightweight for v1 — no API key, no heavy scraping deps.
     Upgrade path: swap this for a real search API once we need better recall.
     """
+    mood_bridge.set_mood("searching")
     try:
         resp = requests.get(
             "https://api.duckduckgo.com/",
@@ -69,6 +71,8 @@ def web_search(query: str) -> str:
         return "No quick answer found for that query."
     except Exception as e:
         return f"Search failed: {e}"
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def _play_audio(path: str) -> None:
@@ -91,10 +95,14 @@ def _play_audio(path: str) -> None:
 
 def speak(text: str) -> str:
     """Say something out loud through the speaker."""
-    out_path = str(Path(tempfile.gettempdir()) / f"walle_speak_{int(time.time())}.wav")
-    voice.speak(text, out_path)
-    _play_audio(out_path)
-    return f"(spoke): {text}"
+    mood_bridge.set_mood("speaking")
+    try:
+        out_path = str(Path(tempfile.gettempdir()) / f"walle_speak_{int(time.time())}.wav")
+        voice.speak(text, out_path)
+        _play_audio(out_path)
+        return f"(spoke): {text}"
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def mic_listen(seconds: int = MIC_RECORD_SECONDS_DEFAULT) -> str:
@@ -263,15 +271,19 @@ def analyze_photo(prompt: str) -> str:
     install. Being loopback-only, this also works regardless of any
     network-level isolation (e.g. mobile hotspot client isolation).
     """
+    mood_bridge.set_mood("taking_photo")
     try:
-        resp = requests.get(f"{BRIDGE_BASE}/photo", timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        return f"analyze_photo failed: could not reach the app's camera bridge ({e})"
+        try:
+            resp = requests.get(f"{BRIDGE_BASE}/photo", timeout=15)
+            resp.raise_for_status()
+        except Exception as e:
+            return f"analyze_photo failed: could not reach the app's camera bridge ({e})"
 
-    photo_path = str(Path(tempfile.gettempdir()) / f"walle_photo_{int(time.time())}.jpg")
-    Path(photo_path).write_bytes(resp.content)
-    return vision.analyze(photo_path, prompt)
+        photo_path = str(Path(tempfile.gettempdir()) / f"walle_photo_{int(time.time())}.jpg")
+        Path(photo_path).write_bytes(resp.content)
+        return vision.analyze(photo_path, prompt)
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def get_location() -> str:

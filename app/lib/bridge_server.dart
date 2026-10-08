@@ -2,10 +2,14 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:geolocator/geolocator.dart';
 
 /// A tiny local HTTP server so the Python brain (running in Termux on the
-/// same phone) can ask the Flutter app to take a photo or get a GPS fix.
+/// same phone) can ask the Flutter app to take a photo or get a GPS fix --
+/// and, the other direction, so the brain can tell the eyes what it's
+/// currently doing (thinking/searching/speaking/taking a photo) so they can
+/// react in real time.
 ///
 /// This exists because Termux:API's own Camera and Location commands are
 /// broken on a sideloaded (non-Play-Store) install -- see tools.py's
@@ -14,6 +18,12 @@ import 'package:geolocator/geolocator.dart';
 /// isolation that broke wireless adb -- nothing here leaves the device.
 class BridgeServer {
   static const int port = 8099;
+
+  /// Current agent activity, pushed by the Python brain via POST /mood.
+  /// One of: idle, thinking, searching, speaking, taking_photo (see
+  /// brain/mood_bridge.py's VALID_STATES -- keep these two lists in sync).
+  /// main.dart listens to this to drive the eyes' visual state.
+  final ValueNotifier<String> moodNotifier = ValueNotifier<String>('idle');
 
   HttpServer? _server;
 
@@ -28,6 +38,8 @@ class BridgeServer {
         await _handleLocation(request);
       } else if (request.uri.path == '/photo') {
         await _handlePhoto(request);
+      } else if (request.uri.path == '/mood' && request.method == 'POST') {
+        await _handleMood(request);
       } else {
         request.response.statusCode = HttpStatus.notFound;
         await request.response.close();
@@ -37,6 +49,21 @@ class BridgeServer {
       request.response.write('error: $e');
       await request.response.close();
     }
+  }
+
+  Future<void> _handleMood(HttpRequest request) async {
+    final body = await utf8.decoder.bind(request).join();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final state = data['state'];
+    if (state is! String || state.isEmpty) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('error: missing "state" string in body');
+      await request.response.close();
+      return;
+    }
+    moodNotifier.value = state;
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
   }
 
   Future<void> _handleLocation(HttpRequest request) async {
@@ -83,5 +110,6 @@ class BridgeServer {
   Future<void> stop() async {
     await _server?.close(force: true);
     _server = null;
+    moodNotifier.dispose();
   }
 }
