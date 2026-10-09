@@ -26,6 +26,15 @@ class WakeWordListener {
   StreamSubscription<Uint8List>? _audioSub;
   bool _bindingsReady = false;
 
+  // The model expects waveform fed in a fixed chunk size (matching the
+  // official sherpa-onnx Dart example's 1600 samples = 0.1s @16kHz) --
+  // feeding it whatever irregular chunk sizes the live mic stream happens
+  // to deliver crashes the native side with a reshape error inside the
+  // encoder's internal cache handling. So we buffer raw samples here and
+  // only ever call acceptWaveform in exact 1600-sample increments.
+  static const int _chunkSize = 1600;
+  final List<double> _sampleBuffer = [];
+
   static bool get isSupported => !kIsWeb && (Platform.isAndroid || Platform.isIOS);
 
   Future<void> start() async {
@@ -72,13 +81,20 @@ class WakeWordListener {
     final stream = _stream;
     if (spotter == null || stream == null) return;
 
-    stream.acceptWaveform(samples: _pcm16ToFloat32(bytes), sampleRate: 16000);
-    while (spotter.isReady(stream)) {
-      spotter.decode(stream);
-      final result = spotter.getResult(stream);
-      if (result.keyword.isNotEmpty) {
-        spotter.reset(stream);
-        onWake();
+    _sampleBuffer.addAll(_pcm16ToFloat32(bytes));
+
+    while (_sampleBuffer.length >= _chunkSize) {
+      final chunk = Float32List.fromList(_sampleBuffer.sublist(0, _chunkSize));
+      _sampleBuffer.removeRange(0, _chunkSize);
+
+      stream.acceptWaveform(samples: chunk, sampleRate: 16000);
+      while (spotter.isReady(stream)) {
+        spotter.decode(stream);
+        final result = spotter.getResult(stream);
+        if (result.keyword.isNotEmpty) {
+          spotter.reset(stream);
+          onWake();
+        }
       }
     }
   }
@@ -108,6 +124,7 @@ class WakeWordListener {
   Future<void> stop() async {
     await _audioSub?.cancel();
     _audioSub = null;
+    _sampleBuffer.clear();
     await _recorder.stop();
     _stream?.free();
     _stream = null;

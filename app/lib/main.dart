@@ -6,7 +6,16 @@ import 'package:rive/rive.dart';
 import 'bridge_server.dart';
 import 'face_tracking.dart';
 import 'rive_eyes.dart';
-import 'wake_word.dart';
+// Wake-word is temporarily disabled -- sherpa-onnx's keyword spotter
+// crashes natively (Ort::Exception in the encoder's Reshape node, Fatal
+// signal 6/SIGABRT) with this exact kws-zipformer-gigaspeech model on real
+// hardware, reproducibly, regardless of audio chunk size fed to it. Verified
+// the model files match the official release and the Dart-side config
+// matches sherpa-onnx's own reference example -- this looks like a genuine
+// upstream incompatibility between sherpa_onnx 1.13.8's bundled ONNX
+// Runtime and this model's exported graph, not a bug in our integration
+// code. See wake_word.dart for the full (otherwise working) implementation.
+// import 'wake_word.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -92,7 +101,7 @@ class _EyesScreenState extends State<EyesScreen>
 
   final BridgeServer _bridgeServer = BridgeServer();
 
-  WakeWordListener? _wakeWordListener;
+  // WakeWordListener? _wakeWordListener; // disabled -- see import comment above
 
   final Random _random = Random();
 
@@ -108,7 +117,7 @@ class _EyesScreenState extends State<EyesScreen>
     _setUpLookBehaviour();
     _bridgeServer.start();
     _bridgeServer.moodNotifier.addListener(_onBrainMoodChanged);
-    _setUpWakeWord();
+    // Wake-word setup disabled for now -- see import comment above.
   }
 
   void _onBrainMoodChanged() {
@@ -116,18 +125,6 @@ class _EyesScreenState extends State<EyesScreen>
     if (mood != null && mounted) {
       setState(() => _mood = mood);
     }
-  }
-
-  void _setUpWakeWord() {
-    _wakeWordListener = WakeWordListener(
-      onWake: () {
-        // Surface that we heard the wake word by snapping to the "thinking"
-        // expression -- the real brain hookup (actually starting mic_listen
-        // on the phone) lands with the eyes<->brain bridge.
-        if (mounted) setState(() => _mood = Mood.thinking);
-      },
-    );
-    _wakeWordListener!.start();
   }
 
   void _setUpLookBehaviour() {
@@ -207,7 +204,6 @@ class _EyesScreenState extends State<EyesScreen>
     _faceTracker?.stop();
     _bridgeServer.moodNotifier.removeListener(_onBrainMoodChanged);
     _bridgeServer.stop();
-    _wakeWordListener?.stop();
     super.dispose();
   }
 

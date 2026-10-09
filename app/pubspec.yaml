@@ -47,16 +47,16 @@ dependencies:
   rive: ^0.13.20
   rive_common: ^0.4.15
 
-  # Wake-word detection ("Hey WALL E"), via sherpa-onnx's open-vocabulary
-  # keyword spotter -- no per-keyword training/account needed (unlike
-  # Porcupine, which was dropped: its flutter_voice_processor dependency
-  # hardcodes compileSdk 31 against ~20 AndroidX libraries that now require
-  # 34+, an unfixable upstream conflict with our other plugins). Model:
-  # sherpa-onnx-kws-zipformer-gigaspeech-3.3M (Apache-2.0), in assets/sherpa_kws/.
-  sherpa_onnx: ^1.13.8
-  record: ^6.1.1
-  path: ^1.9.1
-  path_provider: ^2.1.5
+  # Wake-word is temporarily disabled -- see lib/main.dart's import comment
+  # for why (sherpa-onnx's keyword spotter crashes natively, reproducibly,
+  # on real hardware with this exact model -- an upstream incompatibility,
+  # not a bug in our integration). Porcupine was tried before this and
+  # dropped for an unfixable compileSdk conflict. See lib/wake_word.dart for
+  # the full (otherwise working) sherpa-onnx implementation.
+  # sherpa_onnx: ^1.13.8
+  # record: ^6.1.1
+  # path: ^1.9.1
+  # path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
@@ -87,11 +87,13 @@ flutter:
 
   assets:
     - assets/rive/eyes.riv
-    - assets/sherpa_kws/encoder.onnx
-    - assets/sherpa_kws/decoder.onnx
-    - assets/sherpa_kws/joiner.onnx
-    - assets/sherpa_kws/tokens.txt
-    - assets/sherpa_kws/keywords.txt
+    # sherpa_kws model assets kept on disk (assets/sherpa_kws/) but not
+    # bundled while wake-word is disabled -- see pubspec dependencies above.
+    # - assets/sherpa_kws/encoder.onnx
+    # - assets/sherpa_kws/decoder.onnx
+    # - assets/sherpa_kws/joiner.onnx
+    # - assets/sherpa_kws/tokens.txt
+    # - assets/sherpa_kws/keywords.txt
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
