@@ -271,24 +271,26 @@ def _require_termux(tool_name: str) -> str | None:
 def set_alarm(hour: int, minute: int, label: str = "") -> str:
     """Set a real system alarm via the phone's clock app (not a cron job --
     this survives even if Termux itself gets killed in the background).
+
+    Routed through the Flutter app's own SET_ALARM intent (see
+    bridge_server.dart's /alarm + MainActivity.kt) rather than firing it
+    from Termux directly, because Termux's manifest doesn't declare the
+    com.android.alarm.permission.SET_ALARM permission at all -- there's
+    nothing for `pm grant` to grant (confirmed: a direct `am start` attempt
+    gets a SecurityException naming that exact missing permission). The
+    Flutter app declares it for itself instead (see GitHub issue #12).
     """
-    if (err := _require_termux("set_alarm")) is not None:
-        return err
     try:
-        subprocess.run(
-            [
-                "am", "start", "-a", "android.intent.action.SET_ALARM",
-                "--ei", "android.intent.extra.alarm.HOUR", str(int(hour)),
-                "--ei", "android.intent.extra.alarm.MINUTES", str(int(minute)),
-                "--es", "android.intent.extra.alarm.MESSAGE", label,
-                "--ez", "android.intent.extra.alarm.SKIP_UI", "true",
-            ],
-            check=True, capture_output=True, text=True, timeout=10,
+        resp = requests.post(
+            f"{BRIDGE_BASE}/alarm",
+            json={"hour": int(hour), "minute": int(minute), "label": label},
+            timeout=10,
         )
+        resp.raise_for_status()
         suffix = f" ({label})" if label else ""
         return f"Alarm set for {hour:02d}:{minute:02d}{suffix}"
     except Exception as e:
-        return f"Failed to set alarm: {e}"
+        return f"set_alarm failed: could not reach the app's alarm bridge ({e})"
 
 
 _CRON_FIELD_RE = re.compile(r"^[0-9*/,-]+$")

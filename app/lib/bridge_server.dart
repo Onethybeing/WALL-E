@@ -6,7 +6,9 @@ import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:flutter/services.dart' show MethodChannel;
 import 'package:geolocator/geolocator.dart';
 
-const _mediaChannel = MethodChannel('com.sourav.walle/media');
+// Shared with MainActivity.kt for anything that needs a native Android API
+// Termux can't reach itself -- media key dispatch and the alarm clock intent.
+const _platformChannel = MethodChannel('com.sourav.walle/media');
 
 // Standard Android media key codes -- matches tools.py's media_control()
 // action names (play_pause/next/previous) so the two sides agree.
@@ -61,6 +63,8 @@ class BridgeServer {
         await _handleMood(request);
       } else if (request.uri.path == '/media' && request.method == 'POST') {
         await _handleMedia(request);
+      } else if (request.uri.path == '/alarm' && request.method == 'POST') {
+        await _handleAlarm(request);
       } else {
         request.response.statusCode = HttpStatus.notFound;
         await request.response.close();
@@ -98,7 +102,27 @@ class BridgeServer {
       await request.response.close();
       return;
     }
-    await _mediaChannel.invokeMethod('dispatchMediaKey', {'keyCode': keyCode});
+    await _platformChannel.invokeMethod('dispatchMediaKey', {'keyCode': keyCode});
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
+  }
+
+  Future<void> _handleAlarm(HttpRequest request) async {
+    final body = await utf8.decoder.bind(request).join();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final hour = data['hour'];
+    final minute = data['minute'];
+    if (hour is! int || minute is! int) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('error: "hour" and "minute" must be integers');
+      await request.response.close();
+      return;
+    }
+    await _platformChannel.invokeMethod('setAlarm', {
+      'hour': hour,
+      'minute': minute,
+      'label': data['label'] ?? '',
+    });
     request.response.statusCode = HttpStatus.ok;
     await request.response.close();
   }

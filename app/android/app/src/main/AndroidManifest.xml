@@ -1,6 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- For set_alarm (brain/tools.py): Termux's own manifest doesn't
+         declare this at all, so routing through the Flutter app's own
+         SET_ALARM intent is the only way to make this tool actually work
+         (see GitHub issue #12). -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <application
         android:label="WALL-E"
         android:name="${applicationName}"
