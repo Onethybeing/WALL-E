@@ -13,7 +13,7 @@ import requests
 BRIDGE_BASE = "http://127.0.0.1:8099"
 
 # Valid states the Flutter side (main.dart's Mood enum) knows how to render.
-VALID_STATES = {"idle", "thinking", "searching", "speaking", "taking_photo"}
+VALID_STATES = {"idle", "listening", "thinking", "searching", "speaking", "taking_photo", "error"}
 
 
 def set_mood(state: str) -> None:

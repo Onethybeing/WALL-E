@@ -8,6 +8,7 @@ might misuse, so bash especially should only ever run on a device you own.
 import platform
 import re
 import shlex
+import struct
 import subprocess
 import tempfile
 import time
@@ -26,6 +27,25 @@ import voice
 BASH_TIMEOUT_SECONDS = 30
 MAX_OUTPUT_CHARS = 4000
 MIC_RECORD_SECONDS_DEFAULT = 5
+
+# --- Voice-activity detection for mic_listen -------------------------------
+# termux-microphone-record is a start/stop-file tool, not a true streaming
+# API, so real-time VAD means polling the WAV file as it grows and measuring
+# energy on each new chunk -- see tools.py's mic_listen docstring.
+WAV_HEADER_SIZE = 44  # standard 16-bit PCM WAV header length
+MIC_MAX_SECONDS = 15  # hard cap so a silent mic can't hang forever
+MIC_POLL_INTERVAL = 0.3
+MIC_SILENCE_RMS_THRESHOLD = 500.0  # empirical; 16-bit PCM range is +-32768
+MIC_SILENCE_SECONDS_TO_STOP = 1.0  # how much trailing silence ends the turn
+
+
+def _pcm16_rms(chunk: bytes) -> float:
+    """Root-mean-square energy of raw little-endian 16-bit PCM samples."""
+    usable_len = len(chunk) - (len(chunk) % 2)
+    if usable_len <= 0:
+        return 0.0
+    samples = struct.unpack(f"<{usable_len // 2}h", chunk[:usable_len])
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
 
 def bash(command: str) -> str:
@@ -105,8 +125,14 @@ def speak(text: str) -> str:
         mood_bridge.set_mood("idle")
 
 
-def mic_listen(seconds: int = MIC_RECORD_SECONDS_DEFAULT) -> str:
-    """Record from the microphone for a few seconds and transcribe it.
+def mic_listen(seconds: int | None = None) -> str:
+    """Record from the microphone and transcribe it, stopping automatically
+    once the user stops talking (voice-activity detection) instead of
+    always recording a fixed duration -- faster turnaround, and avoids both
+    clipping long utterances and padding short ones with dead air.
+
+    `seconds`, if given, is used as a hard cap instead of MIC_MAX_SECONDS;
+    the default is pure VAD-driven (recording ends ~1s after speech stops).
 
     Phone-only (Termux): uses `termux-microphone-record`, which requires the
     Termux:API app and microphone permission.
@@ -114,22 +140,62 @@ def mic_listen(seconds: int = MIC_RECORD_SECONDS_DEFAULT) -> str:
     if platform.system() == "Windows":
         return "mic_listen is only implemented for Termux/Android right now."
 
-    rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.wav")
-    start = subprocess.run(
-        ["termux-microphone-record", "-f", rec_path, "-l", str(seconds)],
-        capture_output=True, text=True, check=False,
-    )
-    time.sleep(seconds + 1)
-    subprocess.run(["termux-microphone-record", "-q"], check=False)
+    max_seconds = seconds or MIC_MAX_SECONDS
+    mood_bridge.set_mood("listening")
+    try:
+        rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.wav")
+        start = subprocess.run(
+            ["termux-microphone-record", "-f", rec_path, "-l", str(max_seconds)],
+            capture_output=True, text=True, check=False,
+        )
 
-    if not Path(rec_path).exists():
-        # termux-microphone-record reports errors (e.g. missing RECORD_AUDIO
-        # permission) as JSON on stdout rather than a nonzero exit code, so
-        # surface that instead of a confusing downstream FileNotFoundError.
-        detail = start.stdout.strip() or start.stderr.strip() or "no recording was produced"
-        return f"mic_listen failed: {detail}"
+        heard_speech = False
+        silence_elapsed = 0.0
+        bytes_read = WAV_HEADER_SIZE
+        elapsed = 0.0
+        stopped_early = False
 
-    return voice.transcribe(rec_path)
+        while elapsed < max_seconds:
+            time.sleep(MIC_POLL_INTERVAL)
+            elapsed += MIC_POLL_INTERVAL
+
+            try:
+                with open(rec_path, "rb") as f:
+                    f.seek(bytes_read)
+                    chunk = f.read()
+            except OSError:
+                continue  # file not created yet
+            if not chunk:
+                continue
+            bytes_read += len(chunk)
+
+            rms = _pcm16_rms(chunk)
+            if rms >= MIC_SILENCE_RMS_THRESHOLD:
+                heard_speech = True
+                silence_elapsed = 0.0
+            elif heard_speech:
+                silence_elapsed += MIC_POLL_INTERVAL
+                if silence_elapsed >= MIC_SILENCE_SECONDS_TO_STOP:
+                    stopped_early = True
+                    break
+
+        if stopped_early:
+            subprocess.run(
+                ["termux-microphone-record", "-q"], capture_output=True, check=False
+            )
+        # Either way, give the recorder a moment to flush the final bytes.
+        time.sleep(0.3)
+
+        if not Path(rec_path).exists():
+            # termux-microphone-record reports errors (e.g. missing RECORD_AUDIO
+            # permission) as JSON on stdout rather than a nonzero exit code, so
+            # surface that instead of a confusing downstream FileNotFoundError.
+            detail = start.stdout.strip() or start.stderr.strip() or "no recording was produced"
+            return f"mic_listen failed: {detail}"
+
+        return voice.transcribe(rec_path)
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def remember(key: str, value: str) -> str:
@@ -358,7 +424,8 @@ Use this for anything involving files, system info, or automating tasks.
 - remember(key: str, value: str): Save a fact for later, e.g. a user preference.
 - recall(query: str): Look up previously remembered facts matching a query.
 - speak(text: str): Say something out loud through the phone's speaker.
-- mic_listen(seconds: int): Record from the microphone and transcribe what was said.
+- mic_listen(): Record from the microphone and transcribe what was said -- \
+automatically stops once you stop hearing speech, no need to guess a duration.
 - set_alarm(hour: int, minute: int, label: str): Set a real system alarm.
 - schedule_reminder(cron_expr: str, message: str): Schedule a recurring notification (cron syntax).
 - open_app(uri: str): Open an app or URL via an Android intent (e.g. a Spotify link).

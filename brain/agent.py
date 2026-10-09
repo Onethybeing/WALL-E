@@ -15,12 +15,17 @@ read top to bottom and easy to extend with new tools in tools.py.
 import json
 import re
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import memory
 import mood_bridge
 import skills
 import tools
 from llm import get_llm_client
+
+TRIGGER_SERVER_PORT = 8100
 
 MAX_TOOL_HOPS = 5  # safety cap so a confused model can't loop forever
 
@@ -134,6 +139,80 @@ def run_turn(client, history: list[dict], user_message: str) -> str:
         mood_bridge.set_mood("idle")
 
 
+def _speak_safely(text: str) -> None:
+    """speak() itself calls Gemini TTS -- if that fails too (e.g. no
+    internet), the ORIGINAL failure must still surface somehow instead of
+    being silently swallowed by a second exception. Falls back to a mood
+    the eyes can show without any network call at all.
+    """
+    try:
+        tools.speak(text)
+    except Exception as e:
+        print(f"speak() also failed (likely no internet): {e}")
+        mood_bridge.set_mood("error")
+        time.sleep(1.5)
+        mood_bridge.set_mood("idle")
+
+
+def run_voice_turn(client, history: list[dict]) -> str:
+    """One full voice interaction: listen, think/act, then always speak the
+    final answer out loud -- this is what makes it a *voice* assistant
+    rather than just a text agent that happens to have a speak tool.
+    """
+    transcript = tools.mic_listen()
+    if transcript.startswith("mic_listen failed"):
+        _speak_safely("Sorry, I didn't catch that.")
+        return transcript
+
+    reply = run_turn(client, history, transcript)
+    _speak_safely(reply)
+    return reply
+
+
+class _TriggerHandler(BaseHTTPRequestHandler):
+    """Handles POST /trigger from the Flutter app (a tap on the eyes) by
+    kicking off one voice turn in the background -- responds immediately
+    so the tap doesn't sit waiting on the whole listen-think-speak cycle.
+    """
+
+    client = None
+    history: list[dict] | None = None
+
+    def do_POST(self):
+        if self.path != "/trigger":
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(202)
+        self.end_headers()
+        threading.Thread(target=self._run_turn, daemon=True).start()
+
+    def _run_turn(self):
+        try:
+            run_voice_turn(self.client, self.history)
+        except Exception as e:
+            print(f"voice turn failed: {e}")
+
+    def log_message(self, format, *args):
+        pass  # keep stdout clean -- errors still print via _run_turn
+
+
+def serve():
+    """Run as a persistent background service: no CLI prompt, just waits
+    for the Flutter app to POST /trigger (see app/lib/main.dart's tap
+    handler) and runs a full voice turn each time.
+    """
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    client = get_llm_client()
+    history: list[dict] = []
+    _TriggerHandler.client = client
+    _TriggerHandler.history = history
+
+    server = ThreadingHTTPServer(("127.0.0.1", TRIGGER_SERVER_PORT), _TriggerHandler)
+    print(f"WALL-E trigger server listening on 127.0.0.1:{TRIGGER_SERVER_PORT} (POST /trigger)")
+    server.serve_forever()
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     client = get_llm_client()
@@ -152,4 +231,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--serve" in sys.argv:
+        serve()
+    else:
+        main()

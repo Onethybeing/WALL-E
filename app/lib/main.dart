@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -46,16 +47,18 @@ class WallEApp extends StatelessWidget {
 /// driven for real by the brain via BridgeServer.moodNotifier (see
 /// _EyesScreenState's bridge listener below and brain/mood_bridge.py on the
 /// Python side).
-enum Mood { idle, happy, surprised, thinking, searching, speaking, takingPhoto }
+enum Mood { idle, happy, surprised, thinking, listening, searching, speaking, takingPhoto, error }
 
 /// Maps the state strings the brain POSTs to /mood (brain/mood_bridge.py's
 /// VALID_STATES) onto the Mood enum above. Keep both lists in sync.
 Mood? _moodFromBrainState(String state) => switch (state) {
       'idle' => Mood.idle,
+      'listening' => Mood.listening,
       'thinking' => Mood.thinking,
       'searching' => Mood.searching,
       'speaking' => Mood.speaking,
       'taking_photo' => Mood.takingPhoto,
+      'error' => Mood.error,
       _ => null,
     };
 
@@ -64,10 +67,12 @@ Mood? _moodFromBrainState(String state) => switch (state) {
 /// (it's purely an eye-tracking rig), so mood is communicated via this
 /// overlay rather than by changing the eyes' own artwork.
 ({String label, Color color})? _overlayFor(Mood mood) => switch (mood) {
+      Mood.listening => (label: 'listening...', color: Colors.cyanAccent),
       Mood.thinking => (label: 'thinking...', color: Colors.purpleAccent),
       Mood.searching => (label: 'searching...', color: Colors.yellowAccent),
       Mood.speaking => (label: 'speaking...', color: Colors.greenAccent),
       Mood.takingPhoto => (label: 'taking a photo...', color: Colors.orangeAccent),
+      Mood.error => (label: "couldn't reach the internet", color: Colors.redAccent),
       _ => null,
     };
 
@@ -84,9 +89,6 @@ class _EyesScreenState extends State<EyesScreen>
   // A Ticker fires a callback on every animation frame (~60 times/sec).
   // AnimationController uses that ticker to track elapsed time for us.
   late AnimationController _controller;
-
-  // Current blink progress: 0.0 = eyes fully open, 1.0 = fully shut.
-  double _blink = 0.0;
 
   // Where the pupils are currently drawn, and where they're easing towards.
   // Keeping these separate (rather than jumping straight to a new target)
@@ -112,7 +114,6 @@ class _EyesScreenState extends State<EyesScreen>
       vsync: this,
       duration: const Duration(milliseconds: 16), // ~one frame, just a ticker
     )..addListener(_onTick);
-    _scheduleNextBlink();
     _controller.repeat();
     _setUpLookBehaviour();
     _bridgeServer.start();
@@ -153,29 +154,6 @@ class _EyesScreenState extends State<EyesScreen>
     });
   }
 
-  void _scheduleNextBlink() {
-    final delay = Duration(milliseconds: 2000 + _random.nextInt(3000));
-    Future.delayed(delay, () async {
-      if (!mounted) return;
-      await _playBlink();
-      _scheduleNextBlink();
-    });
-  }
-
-  Future<void> _playBlink() async {
-    const steps = 10;
-    for (int i = 0; i <= steps; i++) {
-      if (!mounted) return;
-      setState(() => _blink = i / steps);
-      await Future.delayed(const Duration(milliseconds: 15));
-    }
-    for (int i = steps; i >= 0; i--) {
-      if (!mounted) return;
-      setState(() => _blink = i / steps);
-      await Future.delayed(const Duration(milliseconds: 15));
-    }
-  }
-
   void _scheduleNextLook({required bool onlyIfNoFace}) {
     final delay = Duration(milliseconds: 1500 + _random.nextInt(2500));
     Future.delayed(delay, () {
@@ -192,10 +170,21 @@ class _EyesScreenState extends State<EyesScreen>
     });
   }
 
-  void _cycleMood() {
-    setState(() {
-      _mood = Mood.values[(_mood.index + 1) % Mood.values.length];
-    });
+  /// Tapping the eyes tells the brain (running its own trigger server in
+  /// Termux, see agent.py's `serve()`/_TriggerHandler) to start one full
+  /// voice turn: listen, think, speak. This is the manual stand-in for the
+  /// wake-word trigger until that's working again (see wake_word.dart).
+  Future<void> _triggerVoiceTurn() async {
+    try {
+      final client = HttpClient();
+      final request = await client.postUrl(Uri.parse('http://127.0.0.1:8100/trigger'));
+      await request.close();
+      client.close();
+    } catch (_) {
+      // Brain's trigger server isn't running (e.g. agent.py --serve hasn't
+      // been started in Termux yet) -- nothing to show the user for this,
+      // the eyes simply won't react, which is itself the signal.
+    }
   }
 
   @override
@@ -213,8 +202,7 @@ class _EyesScreenState extends State<EyesScreen>
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
-        // Tap-to-cycle is a stand-in until the agent's own state drives mood.
-        onTap: _cycleMood,
+        onTap: _triggerVoiceTurn,
         behavior: HitTestBehavior.opaque,
         child: Stack(
           children: [
@@ -258,109 +246,5 @@ class _EyesScreenState extends State<EyesScreen>
         ),
       ),
     );
-  }
-}
-
-/// A single eye: a cyan circle (sclera) with a dark pupil that can move,
-/// an eyelid that closes based on [blink] (0 = open, 1 = shut), and a shape
-/// that changes with [mood].
-class Eye extends StatelessWidget {
-  const Eye({
-    super.key,
-    required this.blink,
-    required this.lookOffset,
-    required this.mood,
-  });
-
-  final double blink;
-  final Offset lookOffset;
-  final Mood mood;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      width: 200,
-      height: 200,
-      child: CustomPaint(
-        painter: _EyePainter(blink: blink, lookOffset: lookOffset, mood: mood),
-      ),
-    );
-  }
-}
-
-class _EyePainter extends CustomPainter {
-  _EyePainter({required this.blink, required this.lookOffset, required this.mood});
-
-  final double blink;
-  final Offset lookOffset;
-  final Mood mood;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-
-    // Mood affects overall eye size and pupil size, on top of the blink animation.
-    final sizeScale = switch (mood) {
-      Mood.surprised => 1.2,
-      Mood.thinking => 0.85,
-      _ => 1.0,
-    };
-    final pupilScale = switch (mood) {
-      Mood.surprised => 0.55,
-      Mood.thinking => 0.35,
-      _ => 0.4,
-    };
-    final radius = (size.width / 2) * sizeScale;
-
-    const cyan = Color(0xFF00F6FF);
-    final scleraPaint = Paint()..color = cyan;
-    final pupilPaint = Paint()..color = Colors.black;
-
-    final openness = 1.0 - blink;
-    canvas.save();
-    canvas.translate(center.dx, center.dy);
-    canvas.scale(1.0, openness.clamp(0.05, 1.0));
-    canvas.translate(-center.dx, -center.dy);
-
-    for (final glow in [
-      (radius * 1.9, 0.10),
-      (radius * 1.5, 0.18),
-      (radius * 1.2, 0.30),
-    ]) {
-      final glowPaint = Paint()
-        ..color = cyan.withOpacity(glow.$2)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 24);
-      canvas.drawCircle(center, glow.$1, glowPaint);
-    }
-
-    if (mood == Mood.happy) {
-      // A happy eye is its own almond/crescent shape (like ^) -- two curves
-      // meeting at the same left/right corner points, not a clipped circle
-      // (clipping a circle against a mismatched curve left a visible kink).
-      final left = Offset(center.dx - radius, center.dy);
-      final right = Offset(center.dx + radius, center.dy);
-      final happyPath = Path()
-        ..moveTo(left.dx, left.dy)
-        ..quadraticBezierTo(center.dx, center.dy - radius * 1.1, right.dx, right.dy)
-        ..quadraticBezierTo(center.dx, center.dy - radius * 0.3, left.dx, left.dy)
-        ..close();
-      canvas.drawPath(happyPath, scleraPaint);
-    } else {
-      canvas.drawCircle(center, radius, scleraPaint);
-
-      final pupilRadius = radius * pupilScale;
-      final maxPupilShift = radius - pupilRadius - 8;
-      final pupilCenter = center + lookOffset * maxPupilShift;
-      canvas.drawCircle(pupilCenter, pupilRadius, pupilPaint);
-    }
-
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(covariant _EyePainter oldDelegate) {
-    return oldDelegate.blink != blink ||
-        oldDelegate.lookOffset != lookOffset ||
-        oldDelegate.mood != mood;
   }
 }
