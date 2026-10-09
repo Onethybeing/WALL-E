@@ -105,7 +105,12 @@ def run_tool_call(call: dict) -> str:
         return f"Error: '{name}' failed: {e}"
 
 
-def run_turn(client, history: list[dict], user_message: str) -> str:
+def run_turn(client, history: list[dict], user_message: str, settle_idle: bool = True) -> str:
+    """`settle_idle=False` skips the finally-block idle reset -- used by
+    run_voice_turn so the eyes go straight from thinking to speaking instead
+    of flashing idle for the single Python statement in between (see
+    GitHub issue #6, the mood-desync complaint).
+    """
     history.append({"role": "user", "content": user_message})
     messages = [{"role": "system", "content": build_system_prompt()}] + history
 
@@ -138,8 +143,10 @@ def run_turn(client, history: list[dict], user_message: str) -> str:
         return giveup_reply
     finally:
         # Whatever happened above (answer, error, giveup), the eyes should
-        # settle back to idle once this turn is done.
-        mood_bridge.set_mood("idle")
+        # settle back to idle once this turn is done -- unless the caller
+        # is about to immediately drive another mood itself (see docstring).
+        if settle_idle:
+            mood_bridge.set_mood("idle")
 
 
 def _speak_safely(text: str) -> None:
@@ -168,7 +175,7 @@ def run_voice_turn(client, history: list[dict]) -> str:
         _speak_safely("Sorry, I didn't catch that.")
         return transcript
 
-    reply = run_turn(client, history, transcript)
+    reply = run_turn(client, history, transcript, settle_idle=False)
     _speak_safely(reply)
     return reply
 

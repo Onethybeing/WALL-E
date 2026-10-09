@@ -62,19 +62,153 @@ Mood? _moodFromBrainState(String state) => switch (state) {
       _ => null,
     };
 
-/// A short label + accent color for each mood, used by the overlay in
+/// An accent color for each mood, used by the overlay in
 /// _EyesScreenState.build() -- the Rive rig itself has no mood animations
 /// (it's purely an eye-tracking rig), so mood is communicated via this
 /// overlay rather than by changing the eyes' own artwork.
-({String label, Color color})? _overlayFor(Mood mood) => switch (mood) {
-      Mood.listening => (label: 'listening...', color: Colors.cyanAccent),
-      Mood.thinking => (label: 'thinking...', color: Colors.purpleAccent),
-      Mood.searching => (label: 'searching...', color: Colors.yellowAccent),
-      Mood.speaking => (label: 'speaking...', color: Colors.greenAccent),
-      Mood.takingPhoto => (label: 'taking a photo...', color: Colors.orangeAccent),
-      Mood.error => (label: "couldn't reach the internet", color: Colors.redAccent),
+Color? _colorFor(Mood mood) => switch (mood) {
+      Mood.listening => Colors.cyanAccent,
+      Mood.thinking => Colors.purpleAccent,
+      Mood.searching => Colors.yellowAccent,
+      Mood.speaking => Colors.greenAccent,
+      Mood.takingPhoto => Colors.orangeAccent,
+      Mood.error => Colors.redAccent,
       _ => null,
     };
+
+/// A small per-mood animated indicator, replacing what used to be a plain
+/// text label ("listening...", "thinking...", etc) -- see GitHub issue #6.
+/// Driven by `phase`, a monotonically increasing value ticking at ~60fps
+/// (see _EyesScreenState._onTick), rather than its own AnimationController.
+class MoodIndicator extends StatelessWidget {
+  const MoodIndicator({super.key, required this.mood, required this.color, required this.phase});
+
+  final Mood mood;
+  final Color color;
+  final double phase;
+
+  @override
+  Widget build(BuildContext context) {
+    return switch (mood) {
+      Mood.listening => _breathingRing(),
+      Mood.thinking => _bouncingDots(),
+      Mood.searching => _spinningArc(),
+      Mood.speaking => _equalizerBars(),
+      Mood.takingPhoto => _shutterPulse(),
+      Mood.error => _slowBlink(),
+      _ => const SizedBox.shrink(),
+    };
+  }
+
+  // A ring that breathes in and out, like something actively paying attention.
+  Widget _breathingRing() {
+    final pulse = (sin(phase) + 1) / 2; // 0..1
+    return Container(
+      width: 36 + pulse * 16,
+      height: 36 + pulse * 16,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: color, width: 4),
+      ),
+    );
+  }
+
+  // Three dots bouncing in sequence, like a classic "thinking" indicator.
+  Widget _bouncingDots() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: List.generate(3, (i) {
+        final bounce = (sin(phase * 2 - i * 0.8) + 1) / 2;
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          child: Transform.translate(
+            offset: Offset(0, -bounce * 10),
+            child: Container(
+              width: 10,
+              height: 10,
+              decoration: BoxDecoration(shape: BoxShape.circle, color: color),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  // A partial ring that spins continuously, like a search/loading spinner.
+  Widget _spinningArc() {
+    return Transform.rotate(
+      angle: phase * 2,
+      child: SizedBox(
+        width: 36,
+        height: 36,
+        child: CustomPaint(painter: _ArcPainter(color: color)),
+      ),
+    );
+  }
+
+  // Vertical bars pulsing at different rates, like an audio equalizer.
+  Widget _equalizerBars() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: List.generate(4, (i) {
+        final h = 8 + ((sin(phase * (2.5 + i * 0.9) + i) + 1) / 2) * 24;
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3),
+          child: Container(
+            width: 6,
+            height: h,
+            decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(3)),
+          ),
+        );
+      }),
+    );
+  }
+
+  // A quick bright flash that fades, like a camera shutter.
+  Widget _shutterPulse() {
+    final flash = ((sin(phase * 3) + 1) / 2).clamp(0.0, 1.0);
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: color.withValues(alpha: 0.3 + flash * 0.7),
+      ),
+    );
+  }
+
+  // A slow, steady blink -- deliberately calmer than the others so an error
+  // doesn't feel as urgent/animated as an active task.
+  Widget _slowBlink() {
+    final blink = (sin(phase * 0.6) + 1) / 2;
+    return Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: color.withValues(alpha: 0.4 + blink * 0.6), width: 4),
+      ),
+    );
+  }
+}
+
+class _ArcPainter extends CustomPainter {
+  _ArcPainter({required this.color});
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4
+      ..strokeCap = StrokeCap.round;
+    canvas.drawArc(Offset.zero & size, 0, pi * 1.3, false, paint);
+  }
+
+  @override
+  bool shouldRepaint(_ArcPainter oldDelegate) => oldDelegate.color != color;
+}
 
 /// The main screen: a black background with two animated eyes centered on it.
 class EyesScreen extends StatefulWidget {
@@ -97,6 +231,10 @@ class _EyesScreenState extends State<EyesScreen>
   Offset _lookTarget = Offset.zero;
 
   Mood _mood = Mood.idle;
+
+  // Drives the mood indicator's pulse -- reuses the existing 60fps ticker
+  // rather than a second AnimationController, see _onTick.
+  double _pulsePhase = 0;
 
   FaceTracker? _faceTracker;
   bool _faceTrackingActive = false;
@@ -153,6 +291,7 @@ class _EyesScreenState extends State<EyesScreen>
     // this is what turns discrete target updates into smooth motion.
     setState(() {
       _lookOffset = Offset.lerp(_lookOffset, _lookTarget, 0.12)!;
+      _pulsePhase += 0.06;
     });
   }
 
@@ -200,7 +339,7 @@ class _EyesScreenState extends State<EyesScreen>
 
   @override
   Widget build(BuildContext context) {
-    final overlay = _overlayFor(_mood);
+    final color = _colorFor(_mood);
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
@@ -211,7 +350,7 @@ class _EyesScreenState extends State<EyesScreen>
             SizedBox.expand(
               child: RiveEyes(lookOffset: _lookOffset),
             ),
-            if (overlay != null)
+            if (color != null)
               IgnorePointer(
                 child: Stack(
                   children: [
@@ -222,23 +361,16 @@ class _EyesScreenState extends State<EyesScreen>
                       child: AnimatedContainer(
                         duration: const Duration(milliseconds: 200),
                         decoration: BoxDecoration(
-                          border: Border.all(color: overlay.color, width: 6),
+                          border: Border.all(color: color, width: 6),
                         ),
                       ),
                     ),
                     Positioned(
-                      bottom: 24,
+                      bottom: 28,
                       left: 0,
                       right: 0,
                       child: Center(
-                        child: Text(
-                          overlay.label,
-                          style: TextStyle(
-                            color: overlay.color,
-                            fontSize: 20,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
+                        child: MoodIndicator(mood: _mood, color: color, phase: _pulsePhase),
                       ),
                     ),
                   ],

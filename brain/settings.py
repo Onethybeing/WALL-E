@@ -15,8 +15,11 @@ DEFAULTS = {
     "llm_provider": "gemini",       # "gemini" or "nemotron"
     "llm_api_key": "",
     "llm_model": "",                # empty = use the provider's own default
-    "voice_provider": "gemini",     # only gemini supported for now
+    "voice_provider": "gemini",     # STT: only gemini supported for now
     "voice_api_key": "",
+    "tts_provider": "gradium",      # TTS: "gradium" or "gemini"
+    "tts_api_key": "",
+    "tts_voice_id": "NbpkqMVS3CJeq2j8",  # Gradium's "Zoey" (US, conversational)
 }
 
 
