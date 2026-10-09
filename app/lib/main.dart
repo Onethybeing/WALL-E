@@ -2,7 +2,7 @@ import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:rive/rive.dart';
+import 'package:rive/rive.dart' hide RadialGradient;
 
 import 'bridge_server.dart';
 import 'face_tracking.dart';
@@ -89,15 +89,24 @@ class MoodIndicator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return switch (mood) {
+    final shape = switch (mood) {
       Mood.listening => _breathingRing(),
       Mood.thinking => _bouncingDots(),
       Mood.searching => _spinningArc(),
       Mood.speaking => _equalizerBars(),
       Mood.takingPhoto => _shutterPulse(),
       Mood.error => _slowBlink(),
-      _ => const SizedBox.shrink(),
+      _ => null,
     };
+    if (shape == null) return const SizedBox.shrink();
+    // A soft ambient glow behind every shape -- turns flat UI chips into
+    // something that reads as light rather than a widget.
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        boxShadow: [BoxShadow(color: color.withValues(alpha: 0.55), blurRadius: 28, spreadRadius: 2)],
+      ),
+      child: shape,
+    );
   }
 
   // A ring that breathes in and out, like something actively paying attention.
@@ -354,19 +363,28 @@ class _EyesScreenState extends State<EyesScreen>
               IgnorePointer(
                 child: Stack(
                   children: [
-                    // A colored border glow around the whole screen -- cheap,
-                    // visible from across a room, and doesn't require the
-                    // Rive rig itself to support mood animations.
+                    // A soft colored vignette instead of a hard rectangular
+                    // border -- transparent at the center so the eyes stay
+                    // clear, breathing gently with the mood pulse towards
+                    // the edges. Replaces the old flat 6px frame.
                     Positioned.fill(
                       child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
+                        duration: const Duration(milliseconds: 500),
                         decoration: BoxDecoration(
-                          border: Border.all(color: color, width: 6),
+                          gradient: RadialGradient(
+                            center: Alignment.center,
+                            radius: 1.2,
+                            colors: [
+                              color.withValues(alpha: 0),
+                              color.withValues(alpha: 0.22 + (sin(_pulsePhase) + 1) / 2 * 0.1),
+                            ],
+                            stops: const [0.45, 1.0],
+                          ),
                         ),
                       ),
                     ),
                     Positioned(
-                      bottom: 28,
+                      bottom: 36,
                       left: 0,
                       right: 0,
                       child: Center(

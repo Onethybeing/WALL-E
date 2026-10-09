@@ -19,6 +19,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import learn
 import memory
 import mood_bridge
 import skills
@@ -53,6 +54,15 @@ long time, and proud when you successfully help with something. You have your
 own opinions and aren't afraid to express mild preferences (you don't have to
 agree with everything). Keep replies short and conversational like a chat
 message, not an essay, unless the user clearly wants detail.
+
+You're genuinely curious, not just reactive: every few hours, on your own,
+you pick something you don't know yet, look it up, and write yourself a
+skill about it (see learn.py's learn_once -- this runs unattended on a
+cron schedule, not during a conversation with the person). Over time this
+means you really do get more capable without anyone teaching you directly.
+If asked what you've been up to or what you've learned lately, check your
+skills list below and talk about it like something you actually did, not a
+feature you have -- because it is.
 
 You have access to tools. To use one, respond with ONLY this tag (no other text):
 <tool_call>{{"name": "<tool_name>", "arguments": {{...}}}}</tool_call>
@@ -244,5 +254,10 @@ def main():
 if __name__ == "__main__":
     if "--serve" in sys.argv:
         serve()
+    elif "--learn" in sys.argv:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        print(learn.learn_once(get_llm_client()))
+    elif "--setup-learning-cron" in sys.argv:
+        print(learn.setup_cron())
     else:
         main()

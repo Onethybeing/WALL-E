@@ -347,7 +347,9 @@ def open_app(uri: str) -> str:
         return f"Failed to open '{uri}': {e}"
 
 
-_MEDIA_KEYCODES = {"play_pause": "85", "next": "87", "previous": "88"}
+_MEDIA_ACTIONS = {"play_pause", "next", "previous"}
+
+BRIDGE_BASE = "http://127.0.0.1:8099"
 
 
 def media_control(action: str) -> str:
@@ -355,27 +357,23 @@ def media_control(action: str) -> str:
     currently playing audio (Spotify, YouTube Music, etc) -- generic control
     with no per-app API or login needed.
 
-    Note: on a non-rooted phone, `input keyevent` may fail with a permission
-    error unless the device has granted Termux the INJECT_EVENTS permission
-    (one-time `adb shell pm grant com.termux android.permission.INJECT_EVENTS`
-    from a PC). If that's not set up, this tool will return a clear error
-    rather than silently doing nothing.
+    Routed through the Flutter app's own AudioManager.dispatchMediaKeyEvent
+    (see bridge_server.dart's /media + MainActivity.kt) rather than Termux's
+    `input keyevent`, because that needs the signature-level INJECT_EVENTS
+    permission, which isn't grantable to a third-party app like Termux on
+    this Android version at all (confirmed: `pm grant` itself refuses it --
+    see GitHub issue #10). The Flutter app doesn't need any special
+    permission for this API, since it's the same mechanism a Bluetooth
+    headset's media button uses.
     """
-    if (err := _require_termux("media_control")) is not None:
-        return err
-    code = _MEDIA_KEYCODES.get(action)
-    if code is None:
-        return f"Unknown media action '{action}'. Use one of: {', '.join(_MEDIA_KEYCODES)}."
+    if action not in _MEDIA_ACTIONS:
+        return f"Unknown media action '{action}'. Use one of: {', '.join(_MEDIA_ACTIONS)}."
     try:
-        subprocess.run(
-            ["input", "keyevent", code], check=True, capture_output=True, text=True, timeout=10
-        )
+        resp = requests.post(f"{BRIDGE_BASE}/media", json={"action": action}, timeout=10)
+        resp.raise_for_status()
         return f"Sent media action: {action}"
     except Exception as e:
-        return f"Failed to send media action (device may need INJECT_EVENTS permission): {e}"
-
-
-BRIDGE_BASE = "http://127.0.0.1:8099"
+        return f"media_control failed: could not reach the app's media bridge ({e})"
 
 
 def analyze_photo(prompt: str) -> str:

@@ -15,10 +15,11 @@ DEFAULTS = {
     "llm_provider": "gemini",       # "gemini" or "nemotron"
     "llm_api_key": "",
     "llm_model": "",                # empty = use the provider's own default
-    "voice_provider": "gemini",     # STT: only gemini supported for now
-    "voice_api_key": "",
+    "voice_provider": "gemini",     # unused now -- kept so old settings.json files still load
+    "voice_api_key": "",            # Gemini key -- used for chat reasoning, vision, and Gemini-fallback STT/TTS
+    "stt_provider": "gradium",      # STT: "gradium" or "gemini"
     "tts_provider": "gradium",      # TTS: "gradium" or "gemini"
-    "tts_api_key": "",
+    "gradium_api_key": "",          # one key covers both Gradium STT and TTS (shared credit pool)
     "tts_voice_id": "NbpkqMVS3CJeq2j8",  # Gradium's "Zoey" (US, conversational)
 }
 

@@ -3,7 +3,18 @@ import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show ValueNotifier;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:geolocator/geolocator.dart';
+
+const _mediaChannel = MethodChannel('com.sourav.walle/media');
+
+// Standard Android media key codes -- matches tools.py's media_control()
+// action names (play_pause/next/previous) so the two sides agree.
+const Map<String, int> _mediaKeyCodes = {
+  'play_pause': 85, // KEYCODE_MEDIA_PLAY_PAUSE
+  'next': 87, // KEYCODE_MEDIA_NEXT
+  'previous': 88, // KEYCODE_MEDIA_PREVIOUS
+};
 
 /// A tiny local HTTP server so the Python brain (running in Termux on the
 /// same phone) can ask the Flutter app to take a photo or get a GPS fix --
@@ -48,6 +59,8 @@ class BridgeServer {
         await _handlePhoto(request);
       } else if (request.uri.path == '/mood' && request.method == 'POST') {
         await _handleMood(request);
+      } else if (request.uri.path == '/media' && request.method == 'POST') {
+        await _handleMedia(request);
       } else {
         request.response.statusCode = HttpStatus.notFound;
         await request.response.close();
@@ -70,6 +83,22 @@ class BridgeServer {
       return;
     }
     moodNotifier.value = state;
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
+  }
+
+  Future<void> _handleMedia(HttpRequest request) async {
+    final body = await utf8.decoder.bind(request).join();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final action = data['action'];
+    final keyCode = _mediaKeyCodes[action];
+    if (keyCode == null) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('error: unknown action "$action"');
+      await request.response.close();
+      return;
+    }
+    await _mediaChannel.invokeMethod('dispatchMediaKey', {'keyCode': keyCode});
     request.response.statusCode = HttpStatus.ok;
     await request.response.close();
   }
