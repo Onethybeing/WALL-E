@@ -324,7 +324,17 @@ class _EyesScreenState extends State<EyesScreen>
   /// Termux, see agent.py's `serve()`/_TriggerHandler) to start one full
   /// voice turn: listen, think, speak. This is the manual stand-in for the
   /// wake-word trigger until that's working again (see wake_word.dart).
+  ///
+  /// A second tap *while already listening* stops the recording right
+  /// away instead of starting a new turn -- this device's mic noise floor
+  /// never fully quiets down (confirmed via direct measurement), so
+  /// automatic silence detection alone isn't reliable here; tapping again
+  /// is the reliable "I'm done talking" signal.
   Future<void> _triggerVoiceTurn() async {
+    if (_mood == Mood.listening) {
+      _bridgeServer.stopListening();
+      return;
+    }
     try {
       final client = HttpClient();
       final request = await client.postUrl(Uri.parse('http://127.0.0.1:8100/trigger'));

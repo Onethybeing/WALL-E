@@ -47,6 +47,18 @@ dependencies:
   rive: ^0.13.20
   rive_common: ^0.4.15
 
+  # Mic recording for mic_listen() (brain/tools.py), via bridge_server.dart's
+  # /listen endpoint -- not Termux:API's RECORD_AUDIO, which `adb shell cmd
+  # appops get com.termux.api` shows capped at AppOps mode "foreground" at
+  # the *uid* level (can't be overridden per-package) on this device/ROM,
+  # silently returning zeroed/empty audio instead of erroring. Same root
+  # cause already worked around for camera (analyze_photo) and location
+  # (get_location) -- WALL-E's own RECORD_AUDIO AppOps is a healthy "allow"
+  # (confirmed via the same adb command), so recording through this app
+  # instead actually works.
+  record: ^6.1.1
+  path_provider: ^2.1.5
+
   # Wake-word is temporarily disabled -- see lib/main.dart's import comment
   # for why (sherpa-onnx's keyword spotter crashes natively, reproducibly,
   # on real hardware with this exact model -- an upstream incompatibility,
@@ -54,9 +66,7 @@ dependencies:
   # dropped for an unfixable compileSdk conflict. See lib/wake_word.dart for
   # the full (otherwise working) sherpa-onnx implementation.
   # sherpa_onnx: ^1.13.8
-  # record: ^6.1.1
   # path: ^1.9.1
-  # path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:

@@ -10,7 +10,6 @@ import os
 import platform
 import re
 import shlex
-import struct
 import subprocess
 import tempfile
 import time
@@ -27,69 +26,7 @@ import voice
 
 BASH_TIMEOUT_SECONDS = 30
 MAX_OUTPUT_CHARS = 4000
-MIC_RECORD_SECONDS_DEFAULT = 5
-
-# --- Voice-activity detection for mic_listen -------------------------------
-# termux-microphone-record is a start/stop-file tool, not a true streaming
-# API, so real-time VAD means polling the recording file as it grows.
-#
-# IMPORTANT: termux-microphone-record's default encoder is AAC-in-MP4, not
-# raw PCM, *regardless of the file extension you give it* -- a ".wav" path
-# silently gets AAC/MP4 bytes written into it. That was the root cause of
-# both bad STT accuracy (we were telling Gemini "audio/wav" about a file
-# that was actually an MP4 container -- it would sometimes still decode it
-# leniently and sometimes 400) and meaningless VAD (treating compressed AAC
-# bytes as if they were linear 16-bit PCM samples). Fixed by explicitly
-# requesting Opus-in-Ogg (`-e opus`) and being honest with Gemini about it
-# (see voice.py's mime_type).
-#
-# A byte-growth-per-poll heuristic on the raw Opus stream was tried and
-# measured to NOT work -- Opus here writes a near-constant ~500 bytes/poll
-# whether or not anyone is talking, so there's no usable signal in the
-# compressed bytes themselves. Instead, each poll shells out to `ffmpeg`
-# (installed via `pkg install ffmpeg`) to decode the recording-so-far to
-# raw 16-bit PCM and measures real RMS energy on just the newly-decoded
-# tail -- slower per poll (~0.1-0.3s) but the energy numbers are real.
-# Python 3.13 removed the `audioop` module, hence doing the RMS math by hand.
-FFMPEG_AVAILABLE = subprocess.run(
-    ["which", "ffmpeg"], capture_output=True, check=False
-).returncode == 0
-MIC_MAX_SECONDS = 15  # hard cap so a silent mic can't hang forever
-# Each poll spawns ffmpeg, and process-spawn overhead alone is ~0.6-0.8s on
-# this low-end device (measured) -- too short a poll interval means the
-# polling loop itself becomes the bottleneck, not the actual silence wait.
-MIC_POLL_INTERVAL = 1.5
-MIC_SILENCE_RMS_THRESHOLD = 500.0  # empirical; 16-bit PCM range is +-32768
-MIC_SILENCE_SECONDS_TO_STOP = 1.0  # how much trailing silence ends the turn
-
-
-def _decode_tail_rms(ogg_path: str, prev_duration_s: float) -> tuple[float, float]:
-    """Decode as much of the (possibly still-growing) ogg file as ffmpeg can
-    manage, and return (new_total_duration_s, rms_of_the_newly_decoded_tail).
-    Returns (prev_duration_s, 0.0) if nothing new could be decoded yet (e.g.
-    the file is still flushing its first page).
-    """
-    pcm_path = ogg_path + ".pcm"
-    subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", ogg_path,
-         "-f", "s16le", "-ar", "16000", "-ac", "1", pcm_path],
-        capture_output=True, timeout=5, check=False,
-    )
-    try:
-        data = Path(pcm_path).read_bytes()
-    except OSError:
-        return prev_duration_s, 0.0
-
-    total_duration_s = (len(data) // 2) / 16000
-    prev_sample_bytes = int(prev_duration_s * 16000) * 2
-    new_bytes = data[prev_sample_bytes:]
-    if len(new_bytes) < 2:
-        return total_duration_s, 0.0
-
-    usable_len = len(new_bytes) - (len(new_bytes) % 2)
-    samples = struct.unpack(f"<{usable_len // 2}h", new_bytes[:usable_len])
-    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-    return total_duration_s, rms
+MIC_MAX_SECONDS = 15  # hard cap so a silent mic can't hang forever -- see mic_listen
 
 
 
@@ -212,61 +149,31 @@ def mic_listen(seconds: int | None = None) -> str:
     `seconds`, if given, is used as a hard cap instead of MIC_MAX_SECONDS;
     the default is pure VAD-driven (recording ends ~1s after speech stops).
 
-    Phone-only (Termux): uses `termux-microphone-record`, which requires the
-    Termux:API app and microphone permission.
+    Routed through the Flutter app's own mic recording (bridge_server.dart's
+    /listen) rather than termux-microphone-record: `adb shell cmd appops get
+    com.termux.api` shows RECORD_AUDIO capped at AppOps mode "foreground" at
+    the *uid* level on this device/ROM (confirmed not overridable per-package
+    either), which silently hands back empty/zeroed audio instead of
+    erroring -- termux-microphone-record "succeeds" while actually capturing
+    nothing. This app's own RECORD_AUDIO AppOps is a healthy "allow" by
+    contrast (same root cause and same fix pattern as analyze_photo and
+    get_location before it).
     """
-    if platform.system() == "Windows":
-        return "mic_listen is only implemented for Termux/Android right now."
-
     max_seconds = seconds or MIC_MAX_SECONDS
     mood_bridge.set_mood("listening")
     try:
-        rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.ogg")
-        start = subprocess.run(
-            ["termux-microphone-record", "-f", rec_path, "-l", str(max_seconds),
-             "-e", "opus", "-r", "16000", "-c", "1"],
-            capture_output=True, text=True, check=False,
-        )
-
-        heard_speech = False
-        silence_elapsed = 0.0
-        decoded_duration_s = 0.0
-        elapsed = 0.0
-        stopped_early = False
-
-        while FFMPEG_AVAILABLE and elapsed < max_seconds:
-            time.sleep(MIC_POLL_INTERVAL)
-            elapsed += MIC_POLL_INTERVAL
-
-            decoded_duration_s, rms = _decode_tail_rms(rec_path, decoded_duration_s)
-
-            if rms >= MIC_SILENCE_RMS_THRESHOLD:
-                heard_speech = True
-                silence_elapsed = 0.0
-            elif heard_speech:
-                silence_elapsed += MIC_POLL_INTERVAL
-                if silence_elapsed >= MIC_SILENCE_SECONDS_TO_STOP:
-                    stopped_early = True
-                    break
-
-        if not FFMPEG_AVAILABLE:
-            # No ffmpeg to decode with -- fall back to just waiting out the
-            # full fixed duration rather than guessing from compressed bytes.
-            time.sleep(max_seconds)
-
-        if stopped_early:
-            subprocess.run(
-                ["termux-microphone-record", "-q"], capture_output=True, check=False
+        try:
+            resp = requests.get(
+                f"{BRIDGE_BASE}/listen",
+                params={"max_seconds": max_seconds},
+                timeout=max_seconds + 10,
             )
-        # Either way, give the recorder a moment to flush the final bytes.
-        time.sleep(0.3)
+            resp.raise_for_status()
+        except Exception as e:
+            return f"mic_listen failed: could not reach the app's mic bridge ({e})"
 
-        if not Path(rec_path).exists():
-            # termux-microphone-record reports errors (e.g. missing RECORD_AUDIO
-            # permission) as JSON on stdout rather than a nonzero exit code, so
-            # surface that instead of a confusing downstream FileNotFoundError.
-            detail = start.stdout.strip() or start.stderr.strip() or "no recording was produced"
-            return f"mic_listen failed: {detail}"
+        rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.wav")
+        Path(rec_path).write_bytes(resp.content)
 
         try:
             return voice.transcribe(rec_path)
@@ -277,7 +184,7 @@ def mic_listen(seconds: int | None = None) -> str:
             # prefix with a friendly fallback instead of silently crashing.
             return f"mic_listen failed: transcription error: {e}"
         finally:
-            Path(rec_path + ".pcm").unlink(missing_ok=True)
+            Path(rec_path).unlink(missing_ok=True)
     finally:
         mood_bridge.set_mood("idle")
 
@@ -411,6 +318,156 @@ def media_control(action: str) -> str:
         return f"media_control failed: could not reach the app's media bridge ({e})"
 
 
+def open_app_by_name(name: str) -> str:
+    """Launch an installed app by its name (e.g. 'Spotify', 'Instagram',
+    'Chrome') -- unlike open_app, which needs a specific URI scheme, this
+    just matches against the names of apps actually installed on the phone.
+    """
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/app/open", json={"name": name}, timeout=10)
+        resp.raise_for_status()
+        if resp.json().get("ok"):
+            return f"Opened {name}."
+        return f"Couldn't find an installed app matching '{name}'."
+    except Exception as e:
+        return f"open_app_by_name failed: could not reach the app bridge ({e})"
+
+
+_SCREEN_ACTIONS = {"back", "home", "recents", "notifications"}
+
+
+def _accessibility_enabled() -> bool:
+    try:
+        resp = requests.get(f"{BRIDGE_BASE}/accessibility/status", timeout=5)
+        resp.raise_for_status()
+        return bool(resp.json().get("enabled"))
+    except Exception:
+        return False
+
+
+_ACCESSIBILITY_HINT = (
+    "Accessibility access isn't enabled yet. Ask the person to open WALL-E's "
+    "accessibility settings (call request_accessibility_access) and turn on "
+    "the WALL-E service -- this can't be granted automatically, Android "
+    "requires a manual tap for a permission this powerful."
+)
+
+
+def request_accessibility_access() -> str:
+    """Opens Android's Accessibility settings screen so the person can
+    enable WALL-E's accessibility service -- required once before
+    control_screen/read_screen/tap_screen_text will work. Can't be granted
+    automatically; this is a deliberately manual step for a permission this
+    powerful (system-wide screen reading + gesture injection).
+    """
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/accessibility/request", timeout=10)
+        resp.raise_for_status()
+        return (
+            "Opened Accessibility settings. Find 'WALL-E' in the list and turn "
+            "it on, then let me know."
+        )
+    except Exception as e:
+        return f"request_accessibility_access failed: could not reach the app bridge ({e})"
+
+
+def read_screen() -> str:
+    """Read the text currently visible on screen (whatever app is in the
+    foreground, not just WALL-E's own eyes) -- use this to see what's there
+    before tapping or scrolling, rather than guessing blind.
+    """
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    try:
+        resp = requests.get(f"{BRIDGE_BASE}/screen/text", timeout=10)
+        resp.raise_for_status()
+        return resp.text.strip() or "(nothing readable on screen right now)"
+    except Exception as e:
+        return f"read_screen failed: could not reach the app bridge ({e})"
+
+
+def tap_screen_text(text: str) -> str:
+    """Find the first visible element containing `text` (case-insensitive)
+    and tap it -- the reliable way to interact with an app: read_screen
+    first to see what's actually there, then tap by the text you saw.
+    """
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/screen/tap_text", json={"text": text}, timeout=10)
+        resp.raise_for_status()
+        if resp.json().get("ok"):
+            return f"Tapped '{text}'."
+        return f"Couldn't find anything matching '{text}' on screen."
+    except Exception as e:
+        return f"tap_screen_text failed: could not reach the app bridge ({e})"
+
+
+def control_screen(action: str) -> str:
+    """Send a system-level screen action: 'back', 'home', 'recents', or
+    'notifications' (opens the notification shade). For scrolling, use
+    scroll_screen instead.
+    """
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    if action not in _SCREEN_ACTIONS:
+        return f"Unknown screen action '{action}'. Use one of: {', '.join(_SCREEN_ACTIONS)}."
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/screen/action", json={"action": action}, timeout=10)
+        resp.raise_for_status()
+        if resp.json().get("ok"):
+            return f"Sent screen action: {action}"
+        return f"Screen action '{action}' didn't go through."
+    except Exception as e:
+        return f"control_screen failed: could not reach the app bridge ({e})"
+
+
+_SCROLL_SWIPES = {
+    # (x1, y1, x2, y2) as fractions of the screen -- a scroll "down" means
+    # the content moves up, so the swipe itself goes from low to high y.
+    "up": (0.5, 0.3, 0.5, 0.75),
+    "down": (0.5, 0.75, 0.5, 0.3),
+    "left": (0.75, 0.5, 0.25, 0.5),
+    "right": (0.25, 0.5, 0.75, 0.5),
+}
+
+
+def scroll_screen(direction: str) -> str:
+    """Scroll the current screen 'up', 'down', 'left', or 'right'."""
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    swipe = _SCROLL_SWIPES.get(direction)
+    if swipe is None:
+        return f"Unknown scroll direction '{direction}'. Use one of: {', '.join(_SCROLL_SWIPES)}."
+    x1, y1, x2, y2 = swipe
+    try:
+        resp = requests.post(
+            f"{BRIDGE_BASE}/screen/gesture",
+            json={"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": 300},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return f"Scrolled {direction}." if resp.json().get("ok") else f"Scroll {direction} didn't go through."
+    except Exception as e:
+        return f"scroll_screen failed: could not reach the app bridge ({e})"
+
+
+def tap_screen_at(x: float, y: float) -> str:
+    """Tap the screen at a specific point, as fractions of the screen size
+    (0.0-1.0 for both x and y, e.g. x=0.5, y=0.5 is dead center). Prefer
+    tap_screen_text when you can read what you want to tap instead."""
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    try:
+        resp = requests.post(
+            f"{BRIDGE_BASE}/screen/gesture", json={"x1": x, "y1": y}, timeout=10
+        )
+        resp.raise_for_status()
+        return f"Tapped ({x}, {y})." if resp.json().get("ok") else "Tap didn't go through."
+    except Exception as e:
+        return f"tap_screen_at failed: could not reach the app bridge ({e})"
+
+
 def analyze_photo(prompt: str) -> str:
     """Take a photo with the phone's camera and ask a question about it,
     e.g. "what am I wearing" or "what does this room look like".
@@ -498,6 +555,13 @@ REGISTRY = {
     "analyze_photo": analyze_photo,
     "get_location": get_location,
     "get_weather": get_weather,
+    "open_app_by_name": open_app_by_name,
+    "request_accessibility_access": request_accessibility_access,
+    "read_screen": read_screen,
+    "tap_screen_text": tap_screen_text,
+    "tap_screen_at": tap_screen_at,
+    "scroll_screen": scroll_screen,
+    "control_screen": control_screen,
 }
 
 # Descriptions injected into the system prompt so the model knows what it can do.
@@ -519,4 +583,12 @@ automatically stops once you stop hearing speech, no need to guess a duration.
 - analyze_photo(prompt: str): Take a photo with the camera and ask a question about what it shows.
 - get_location(): Get the phone's current GPS location as JSON (lat/lon/accuracy).
 - get_weather(latitude: float, longitude: float): Get current weather for a location.
+- open_app_by_name(name: str): Launch an installed app by its name (e.g. "Spotify").
+- request_accessibility_access(): Open settings so the person can enable screen control \
+(needed once before read_screen/tap_screen_text/tap_screen_at/scroll_screen/control_screen work).
+- read_screen(): Read the text currently visible on screen, in whatever app is in the foreground.
+- tap_screen_text(text: str): Find and tap the first on-screen element matching this text.
+- tap_screen_at(x: float, y: float): Tap a specific point (fractions 0.0-1.0 of the screen).
+- scroll_screen(direction: str): Scroll the screen "up", "down", "left", or "right".
+- control_screen(action: str): Send "back", "home", "recents", or "notifications".
 """

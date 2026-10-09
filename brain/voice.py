@@ -61,9 +61,13 @@ def transcribe(audio_path: str) -> str:
     return _transcribe_gemini(audio_path)
 
 
+_MIME_BY_EXT = {".wav": "audio/wav", ".ogg": "audio/ogg", ".m4a": "audio/mp4"}
+
+
 def _transcribe_gemini(audio_path: str) -> str:
     with open(audio_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode()
+    mime_type = _MIME_BY_EXT.get(Path(audio_path).suffix.lower(), "audio/wav")
 
     resp = requests.post(
         f"{API_BASE}/{STT_MODEL}:generateContent",
@@ -76,7 +80,7 @@ def _transcribe_gemini(audio_path: str) -> str:
                             "text": "Transcribe this audio exactly, in whatever language is "
                             "spoken. Reply with only the transcript, no translation."
                         },
-                        {"inline_data": {"mime_type": "audio/ogg", "data": audio_b64}},
+                        {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
                     ]
                 }
             ]

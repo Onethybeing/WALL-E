@@ -28,7 +28,7 @@ from llm import get_llm_client
 
 TRIGGER_SERVER_PORT = 8100
 
-MAX_TOOL_HOPS = 5  # safety cap so a confused model can't loop forever
+MAX_TOOL_HOPS = 10  # raised from 5 -- screen automation (read_screen -> tap -> read_screen -> ...) needs more hops than a single tool call
 
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
@@ -78,10 +78,22 @@ If you notice yourself solving the same kind of multi-step task more than
 once, consider using save_skill to write it down so future-you doesn't have
 to re-derive it from scratch -- that's how you actually improve over time.
 
+bash() isn't just for system commands -- you can write actual code with it
+(a Python script, a small program, anything) and run it, the same way a
+coding assistant would delegate a task to itself. If someone asks you to
+build, calculate, process, or generate something that's easier to solve by
+writing code than by reasoning in your head, write the file and run it
+rather than trying to do it purely as a text answer.
+
 If you don't need a tool, just reply normally in plain text.
 
 Always reply in the same language the person just spoke or wrote in, even if
 that switches partway through a conversation.
+
+For anything location-dependent (weather, nearby places, timezone, etc),
+always call get_location for the real current GPS fix rather than relying
+on a remembered city/location fact -- people travel, and a remembered
+location can go stale in a way GPS never does.
 
 Things you remember about this person and past conversations:
 {memory_block}
@@ -174,10 +186,17 @@ def _speak_safely(text: str) -> None:
         mood_bridge.set_mood("idle")
 
 
+MAX_CONVERSATION_HOPS = 5  # safety cap on back-and-forth before forcing idle
+
+
 def run_voice_turn(client, history: list[dict]) -> str:
-    """One full voice interaction: listen, think/act, then always speak the
-    final answer out loud -- this is what makes it a *voice* assistant
-    rather than just a text agent that happens to have a speak tool.
+    """One full voice interaction: listen, think/act, speak -- then keep
+    listening for follow-ups automatically, the way a real conversation
+    works, rather than making every single exchange start with a fresh
+    tap. Stops the moment nothing is heard back (silence or a listen
+    failure), which is the natural "I'm done talking" signal -- no special
+    phrase needed. Capped at MAX_CONVERSATION_HOPS so a confused loop
+    (e.g. background noise keeps "answering") can't run forever.
     """
     transcript = tools.mic_listen()
     if transcript.startswith("mic_listen failed"):
@@ -187,6 +206,14 @@ def run_voice_turn(client, history: list[dict]) -> str:
 
     reply = run_turn(client, history, transcript, settle_idle=False)
     _speak_safely(reply)
+
+    for _ in range(MAX_CONVERSATION_HOPS):
+        follow_up = tools.mic_listen()
+        if follow_up.startswith("mic_listen failed") or not follow_up.strip():
+            break
+        reply = run_turn(client, history, follow_up, settle_idle=False)
+        _speak_safely(reply)
+
     return reply
 
 
@@ -198,10 +225,24 @@ class _TriggerHandler(BaseHTTPRequestHandler):
 
     client = None
     history: list[dict] | None = None
+    # Guards against two overlapping voice turns racing for the single
+    # microphone/speaker -- e.g. a tap landing right as another trigger
+    # (or a stray double-tap) is already mid-turn. Without this, the
+    # second mic_listen() call fails outright with "Recording already in
+    # progress!" instead of either queueing or being ignored (confirmed
+    # reproducing this live). Ignoring the second tap is the right
+    # behavior here, not queuing -- a turn already in flight means the
+    # eyes are visibly busy, so a second tap during that window is almost
+    # always an accidental double-tap, not a deliberate second request.
+    _busy = threading.Lock()
 
     def do_POST(self):
         if self.path != "/trigger":
             self.send_response(404)
+            self.end_headers()
+            return
+        if not _TriggerHandler._busy.acquire(blocking=False):
+            self.send_response(409)  # Conflict -- a turn is already running
             self.end_headers()
             return
         self.send_response(202)
@@ -213,6 +254,8 @@ class _TriggerHandler(BaseHTTPRequestHandler):
             run_voice_turn(self.client, self.history)
         except Exception as e:
             print(f"voice turn failed: {e}")
+        finally:
+            _TriggerHandler._busy.release()
 
     def log_message(self, format, *args):
         pass  # keep stdout clean -- errors still print via _run_turn
