@@ -25,6 +25,14 @@ class BridgeServer {
   /// main.dart listens to this to drive the eyes' visual state.
   final ValueNotifier<String> moodNotifier = ValueNotifier<String>('idle');
 
+  // CameraX (which the `camera` plugin uses under the hood) refuses to bind
+  // two independent CameraController sessions at once on this hardware --
+  // face_tracking.dart's front-camera stream being live caused takePicture()
+  // here to fail with "ImageCaptureException: Not bound to a valid Camera".
+  // main.dart wires these to pause/resume its FaceTracker around a photo.
+  Future<void> Function()? pauseFaceCamera;
+  Future<void> Function()? resumeFaceCamera;
+
   HttpServer? _server;
 
   Future<void> start() async {
@@ -94,17 +102,23 @@ class BridgeServer {
       (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => cameras.first,
     );
-    // A dedicated controller for the still photo, separate from the one
-    // face_tracking.dart keeps running for the front-camera live stream.
-    final controller = CameraController(back, ResolutionPreset.medium, enableAudio: false);
-    await controller.initialize();
-    final file = await controller.takePicture();
-    final bytes = await file.readAsBytes();
-    await controller.dispose();
 
-    request.response.headers.contentType = ContentType('image', 'jpeg');
-    request.response.add(bytes);
-    await request.response.close();
+    // Free up the camera hardware from face_tracking.dart's front-camera
+    // stream first -- see the pauseFaceCamera/resumeFaceCamera doc comment.
+    await pauseFaceCamera?.call();
+    try {
+      final controller = CameraController(back, ResolutionPreset.medium, enableAudio: false);
+      await controller.initialize();
+      final file = await controller.takePicture();
+      final bytes = await file.readAsBytes();
+      await controller.dispose();
+
+      request.response.headers.contentType = ContentType('image', 'jpeg');
+      request.response.add(bytes);
+      await request.response.close();
+    } finally {
+      await resumeFaceCamera?.call();
+    }
   }
 
   Future<void> stop() async {

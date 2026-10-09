@@ -116,6 +116,8 @@ class _EyesScreenState extends State<EyesScreen>
     )..addListener(_onTick);
     _controller.repeat();
     _setUpLookBehaviour();
+    _bridgeServer.pauseFaceCamera = () async => _faceTracker?.stop();
+    _bridgeServer.resumeFaceCamera = () async => _faceTracker?.start();
     _bridgeServer.start();
     _bridgeServer.moodNotifier.addListener(_onBrainMoodChanged);
     // Wake-word setup disabled for now -- see import comment above.

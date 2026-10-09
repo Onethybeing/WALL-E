@@ -70,6 +70,9 @@ to re-derive it from scratch -- that's how you actually improve over time.
 
 If you don't need a tool, just reply normally in plain text.
 
+Always reply in the same language the person just spoke or wrote in, even if
+that switches partway through a conversation.
+
 Things you remember about this person and past conversations:
 {memory_block}
 """
@@ -161,6 +164,7 @@ def run_voice_turn(client, history: list[dict]) -> str:
     """
     transcript = tools.mic_listen()
     if transcript.startswith("mic_listen failed"):
+        print(f"mic_listen reported failure: {transcript}")
         _speak_safely("Sorry, I didn't catch that.")
         return transcript
 

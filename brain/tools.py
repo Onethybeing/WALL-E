@@ -30,22 +30,67 @@ MIC_RECORD_SECONDS_DEFAULT = 5
 
 # --- Voice-activity detection for mic_listen -------------------------------
 # termux-microphone-record is a start/stop-file tool, not a true streaming
-# API, so real-time VAD means polling the WAV file as it grows and measuring
-# energy on each new chunk -- see tools.py's mic_listen docstring.
-WAV_HEADER_SIZE = 44  # standard 16-bit PCM WAV header length
+# API, so real-time VAD means polling the recording file as it grows.
+#
+# IMPORTANT: termux-microphone-record's default encoder is AAC-in-MP4, not
+# raw PCM, *regardless of the file extension you give it* -- a ".wav" path
+# silently gets AAC/MP4 bytes written into it. That was the root cause of
+# both bad STT accuracy (we were telling Gemini "audio/wav" about a file
+# that was actually an MP4 container -- it would sometimes still decode it
+# leniently and sometimes 400) and meaningless VAD (treating compressed AAC
+# bytes as if they were linear 16-bit PCM samples). Fixed by explicitly
+# requesting Opus-in-Ogg (`-e opus`) and being honest with Gemini about it
+# (see voice.py's mime_type).
+#
+# A byte-growth-per-poll heuristic on the raw Opus stream was tried and
+# measured to NOT work -- Opus here writes a near-constant ~500 bytes/poll
+# whether or not anyone is talking, so there's no usable signal in the
+# compressed bytes themselves. Instead, each poll shells out to `ffmpeg`
+# (installed via `pkg install ffmpeg`) to decode the recording-so-far to
+# raw 16-bit PCM and measures real RMS energy on just the newly-decoded
+# tail -- slower per poll (~0.1-0.3s) but the energy numbers are real.
+# Python 3.13 removed the `audioop` module, hence doing the RMS math by hand.
+FFMPEG_AVAILABLE = subprocess.run(
+    ["which", "ffmpeg"], capture_output=True, check=False
+).returncode == 0
 MIC_MAX_SECONDS = 15  # hard cap so a silent mic can't hang forever
-MIC_POLL_INTERVAL = 0.3
+# Each poll spawns ffmpeg, and process-spawn overhead alone is ~0.6-0.8s on
+# this low-end device (measured) -- too short a poll interval means the
+# polling loop itself becomes the bottleneck, not the actual silence wait.
+MIC_POLL_INTERVAL = 1.5
 MIC_SILENCE_RMS_THRESHOLD = 500.0  # empirical; 16-bit PCM range is +-32768
 MIC_SILENCE_SECONDS_TO_STOP = 1.0  # how much trailing silence ends the turn
 
 
-def _pcm16_rms(chunk: bytes) -> float:
-    """Root-mean-square energy of raw little-endian 16-bit PCM samples."""
-    usable_len = len(chunk) - (len(chunk) % 2)
-    if usable_len <= 0:
-        return 0.0
-    samples = struct.unpack(f"<{usable_len // 2}h", chunk[:usable_len])
-    return (sum(s * s for s in samples) / len(samples)) ** 0.5
+def _decode_tail_rms(ogg_path: str, prev_duration_s: float) -> tuple[float, float]:
+    """Decode as much of the (possibly still-growing) ogg file as ffmpeg can
+    manage, and return (new_total_duration_s, rms_of_the_newly_decoded_tail).
+    Returns (prev_duration_s, 0.0) if nothing new could be decoded yet (e.g.
+    the file is still flushing its first page).
+    """
+    pcm_path = ogg_path + ".pcm"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", ogg_path,
+         "-f", "s16le", "-ar", "16000", "-ac", "1", pcm_path],
+        capture_output=True, timeout=5, check=False,
+    )
+    try:
+        data = Path(pcm_path).read_bytes()
+    except OSError:
+        return prev_duration_s, 0.0
+
+    total_duration_s = (len(data) // 2) / 16000
+    prev_sample_bytes = int(prev_duration_s * 16000) * 2
+    new_bytes = data[prev_sample_bytes:]
+    if len(new_bytes) < 2:
+        return total_duration_s, 0.0
+
+    usable_len = len(new_bytes) - (len(new_bytes) % 2)
+    samples = struct.unpack(f"<{usable_len // 2}h", new_bytes[:usable_len])
+    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+    return total_duration_s, rms
+
+
 
 
 def bash(command: str) -> str:
@@ -143,33 +188,25 @@ def mic_listen(seconds: int | None = None) -> str:
     max_seconds = seconds or MIC_MAX_SECONDS
     mood_bridge.set_mood("listening")
     try:
-        rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.wav")
+        rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.ogg")
         start = subprocess.run(
-            ["termux-microphone-record", "-f", rec_path, "-l", str(max_seconds)],
+            ["termux-microphone-record", "-f", rec_path, "-l", str(max_seconds),
+             "-e", "opus", "-r", "16000", "-c", "1"],
             capture_output=True, text=True, check=False,
         )
 
         heard_speech = False
         silence_elapsed = 0.0
-        bytes_read = WAV_HEADER_SIZE
+        decoded_duration_s = 0.0
         elapsed = 0.0
         stopped_early = False
 
-        while elapsed < max_seconds:
+        while FFMPEG_AVAILABLE and elapsed < max_seconds:
             time.sleep(MIC_POLL_INTERVAL)
             elapsed += MIC_POLL_INTERVAL
 
-            try:
-                with open(rec_path, "rb") as f:
-                    f.seek(bytes_read)
-                    chunk = f.read()
-            except OSError:
-                continue  # file not created yet
-            if not chunk:
-                continue
-            bytes_read += len(chunk)
+            decoded_duration_s, rms = _decode_tail_rms(rec_path, decoded_duration_s)
 
-            rms = _pcm16_rms(chunk)
             if rms >= MIC_SILENCE_RMS_THRESHOLD:
                 heard_speech = True
                 silence_elapsed = 0.0
@@ -178,6 +215,11 @@ def mic_listen(seconds: int | None = None) -> str:
                 if silence_elapsed >= MIC_SILENCE_SECONDS_TO_STOP:
                     stopped_early = True
                     break
+
+        if not FFMPEG_AVAILABLE:
+            # No ffmpeg to decode with -- fall back to just waiting out the
+            # full fixed duration rather than guessing from compressed bytes.
+            time.sleep(max_seconds)
 
         if stopped_early:
             subprocess.run(
@@ -193,7 +235,16 @@ def mic_listen(seconds: int | None = None) -> str:
             detail = start.stdout.strip() or start.stderr.strip() or "no recording was produced"
             return f"mic_listen failed: {detail}"
 
-        return voice.transcribe(rec_path)
+        try:
+            return voice.transcribe(rec_path)
+        except Exception as e:
+            # A transcription-API failure (bad request, no internet, etc) is
+            # exactly as "mic_listen failed" to the caller as a recording
+            # failure -- run_voice_turn already knows how to react to that
+            # prefix with a friendly fallback instead of silently crashing.
+            return f"mic_listen failed: transcription error: {e}"
+        finally:
+            Path(rec_path + ".pcm").unlink(missing_ok=True)
     finally:
         mood_bridge.set_mood("idle")
 

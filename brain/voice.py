@@ -19,6 +19,15 @@ TTS_MODEL = "gemini-3.8-flash-lite-tts"
 VOICE_NAME = "Kore"
 
 
+def _check(resp: requests.Response) -> None:
+    """requests' default raise_for_status() discards the response body,
+    which for a 400 is almost always the one piece of info that explains
+    *why* -- surface it instead of a bare '400 Client Error'.
+    """
+    if not resp.ok:
+        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text}")
+
+
 def _api_key() -> str:
     key = settings.load()["voice_api_key"] or os.environ.get("GEMINI_API_KEY")
     if not key:
@@ -41,15 +50,18 @@ def transcribe(audio_path: str) -> str:
             "contents": [
                 {
                     "parts": [
-                        {"text": "Transcribe this audio exactly. Reply with only the transcript."},
-                        {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+                        {
+                            "text": "Transcribe this audio exactly, in whatever language is "
+                            "spoken. Reply with only the transcript, no translation."
+                        },
+                        {"inline_data": {"mime_type": "audio/ogg", "data": audio_b64}},
                     ]
                 }
             ]
         },
         timeout=30,
     )
-    resp.raise_for_status()
+    _check(resp)
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
@@ -70,7 +82,7 @@ def speak(text: str, out_path: str) -> str:
         },
         timeout=30,
     )
-    resp.raise_for_status()
+    _check(resp)
     data = resp.json()
     audio_b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
     with open(out_path, "wb") as f:
