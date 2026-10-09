@@ -2,10 +2,27 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show ValueNotifier;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:geolocator/geolocator.dart';
 
+// Shared with MainActivity.kt for anything that needs a native Android API
+// Termux can't reach itself -- media key dispatch and the alarm clock intent.
+const _platformChannel = MethodChannel('com.sourav.walle/media');
+
+// Standard Android media key codes -- matches tools.py's media_control()
+// action names (play_pause/next/previous) so the two sides agree.
+const Map<String, int> _mediaKeyCodes = {
+  'play_pause': 85, // KEYCODE_MEDIA_PLAY_PAUSE
+  'next': 87, // KEYCODE_MEDIA_NEXT
+  'previous': 88, // KEYCODE_MEDIA_PREVIOUS
+};
+
 /// A tiny local HTTP server so the Python brain (running in Termux on the
-/// same phone) can ask the Flutter app to take a photo or get a GPS fix.
+/// same phone) can ask the Flutter app to take a photo or get a GPS fix --
+/// and, the other direction, so the brain can tell the eyes what it's
+/// currently doing (thinking/searching/speaking/taking a photo) so they can
+/// react in real time.
 ///
 /// This exists because Termux:API's own Camera and Location commands are
 /// broken on a sideloaded (non-Play-Store) install -- see tools.py's
@@ -14,6 +31,20 @@ import 'package:geolocator/geolocator.dart';
 /// isolation that broke wireless adb -- nothing here leaves the device.
 class BridgeServer {
   static const int port = 8099;
+
+  /// Current agent activity, pushed by the Python brain via POST /mood.
+  /// One of: idle, thinking, searching, speaking, taking_photo (see
+  /// brain/mood_bridge.py's VALID_STATES -- keep these two lists in sync).
+  /// main.dart listens to this to drive the eyes' visual state.
+  final ValueNotifier<String> moodNotifier = ValueNotifier<String>('idle');
+
+  // CameraX (which the `camera` plugin uses under the hood) refuses to bind
+  // two independent CameraController sessions at once on this hardware --
+  // face_tracking.dart's front-camera stream being live caused takePicture()
+  // here to fail with "ImageCaptureException: Not bound to a valid Camera".
+  // main.dart wires these to pause/resume its FaceTracker around a photo.
+  Future<void> Function()? pauseFaceCamera;
+  Future<void> Function()? resumeFaceCamera;
 
   HttpServer? _server;
 
@@ -28,6 +59,12 @@ class BridgeServer {
         await _handleLocation(request);
       } else if (request.uri.path == '/photo') {
         await _handlePhoto(request);
+      } else if (request.uri.path == '/mood' && request.method == 'POST') {
+        await _handleMood(request);
+      } else if (request.uri.path == '/media' && request.method == 'POST') {
+        await _handleMedia(request);
+      } else if (request.uri.path == '/alarm' && request.method == 'POST') {
+        await _handleAlarm(request);
       } else {
         request.response.statusCode = HttpStatus.notFound;
         await request.response.close();
@@ -37,6 +74,57 @@ class BridgeServer {
       request.response.write('error: $e');
       await request.response.close();
     }
+  }
+
+  Future<void> _handleMood(HttpRequest request) async {
+    final body = await utf8.decoder.bind(request).join();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final state = data['state'];
+    if (state is! String || state.isEmpty) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('error: missing "state" string in body');
+      await request.response.close();
+      return;
+    }
+    moodNotifier.value = state;
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
+  }
+
+  Future<void> _handleMedia(HttpRequest request) async {
+    final body = await utf8.decoder.bind(request).join();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final action = data['action'];
+    final keyCode = _mediaKeyCodes[action];
+    if (keyCode == null) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('error: unknown action "$action"');
+      await request.response.close();
+      return;
+    }
+    await _platformChannel.invokeMethod('dispatchMediaKey', {'keyCode': keyCode});
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
+  }
+
+  Future<void> _handleAlarm(HttpRequest request) async {
+    final body = await utf8.decoder.bind(request).join();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final hour = data['hour'];
+    final minute = data['minute'];
+    if (hour is! int || minute is! int) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('error: "hour" and "minute" must be integers');
+      await request.response.close();
+      return;
+    }
+    await _platformChannel.invokeMethod('setAlarm', {
+      'hour': hour,
+      'minute': minute,
+      'label': data['label'] ?? '',
+    });
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
   }
 
   Future<void> _handleLocation(HttpRequest request) async {
@@ -67,21 +155,28 @@ class BridgeServer {
       (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => cameras.first,
     );
-    // A dedicated controller for the still photo, separate from the one
-    // face_tracking.dart keeps running for the front-camera live stream.
-    final controller = CameraController(back, ResolutionPreset.medium, enableAudio: false);
-    await controller.initialize();
-    final file = await controller.takePicture();
-    final bytes = await file.readAsBytes();
-    await controller.dispose();
 
-    request.response.headers.contentType = ContentType('image', 'jpeg');
-    request.response.add(bytes);
-    await request.response.close();
+    // Free up the camera hardware from face_tracking.dart's front-camera
+    // stream first -- see the pauseFaceCamera/resumeFaceCamera doc comment.
+    await pauseFaceCamera?.call();
+    try {
+      final controller = CameraController(back, ResolutionPreset.medium, enableAudio: false);
+      await controller.initialize();
+      final file = await controller.takePicture();
+      final bytes = await file.readAsBytes();
+      await controller.dispose();
+
+      request.response.headers.contentType = ContentType('image', 'jpeg');
+      request.response.add(bytes);
+      await request.response.close();
+    } finally {
+      await resumeFaceCamera?.call();
+    }
   }
 
   Future<void> stop() async {
     await _server?.close(force: true);
     _server = null;
+    moodNotifier.dispose();
   }
 }

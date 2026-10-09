@@ -42,13 +42,21 @@ dependencies:
   permission_handler: ^11.3.1
   geolocator: ^13.0.2
 
-  # Wake-word (porcupine_flutter) is temporarily disabled: its bundled
-  # flutter_voice_processor dependency hardcodes compileSdk 31, which
-  # conflicts with the newer AndroidX versions camera/mlkit pull in --
-  # an upstream packaging issue, not something fixable from this project.
-  # See lib/wake_word.dart -- the integration code is ready to re-enable
-  # once Picovoice ships a fix (or we swap to a different wake-word lib).
-  # porcupine_flutter: ^4.0.0
+  # Eye-tracking animation, rendered from assets/rive/eyes.riv ("Eye Tracking"
+  # by sarahpuspdew, CC BY 4.0 -- https://rive.app/community/files/6680-12901-eye-tracking/)
+  rive: ^0.13.20
+  rive_common: ^0.4.15
+
+  # Wake-word is temporarily disabled -- see lib/main.dart's import comment
+  # for why (sherpa-onnx's keyword spotter crashes natively, reproducibly,
+  # on real hardware with this exact model -- an upstream incompatibility,
+  # not a bug in our integration). Porcupine was tried before this and
+  # dropped for an unfixable compileSdk conflict. See lib/wake_word.dart for
+  # the full (otherwise working) sherpa-onnx implementation.
+  # sherpa_onnx: ^1.13.8
+  # record: ^6.1.1
+  # path: ^1.9.1
+  # path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
@@ -60,6 +68,11 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.3
+
+flutter_launcher_icons:
+  android: true
+  image_path: "assets/icon_source.png"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -72,10 +85,15 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  assets:
+    - assets/rive/eyes.riv
+    # sherpa_kws model assets kept on disk (assets/sherpa_kws/) but not
+    # bundled while wake-word is disabled -- see pubspec dependencies above.
+    # - assets/sherpa_kws/encoder.onnx
+    # - assets/sherpa_kws/decoder.onnx
+    # - assets/sherpa_kws/joiner.onnx
+    # - assets/sherpa_kws/tokens.txt
+    # - assets/sherpa_kws/keywords.txt
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

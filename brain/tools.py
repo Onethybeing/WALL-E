@@ -5,9 +5,12 @@ Keep this list short and sharp — every tool here is something the model
 might misuse, so bash especially should only ever run on a device you own.
 """
 
+import json
+import os
 import platform
 import re
 import shlex
+import struct
 import subprocess
 import tempfile
 import time
@@ -15,9 +18,9 @@ from pathlib import Path
 
 import requests
 
-import json
-
 import memory
+import mood_bridge
+import settings
 import skills
 import vision
 import voice
@@ -25,6 +28,70 @@ import voice
 BASH_TIMEOUT_SECONDS = 30
 MAX_OUTPUT_CHARS = 4000
 MIC_RECORD_SECONDS_DEFAULT = 5
+
+# --- Voice-activity detection for mic_listen -------------------------------
+# termux-microphone-record is a start/stop-file tool, not a true streaming
+# API, so real-time VAD means polling the recording file as it grows.
+#
+# IMPORTANT: termux-microphone-record's default encoder is AAC-in-MP4, not
+# raw PCM, *regardless of the file extension you give it* -- a ".wav" path
+# silently gets AAC/MP4 bytes written into it. That was the root cause of
+# both bad STT accuracy (we were telling Gemini "audio/wav" about a file
+# that was actually an MP4 container -- it would sometimes still decode it
+# leniently and sometimes 400) and meaningless VAD (treating compressed AAC
+# bytes as if they were linear 16-bit PCM samples). Fixed by explicitly
+# requesting Opus-in-Ogg (`-e opus`) and being honest with Gemini about it
+# (see voice.py's mime_type).
+#
+# A byte-growth-per-poll heuristic on the raw Opus stream was tried and
+# measured to NOT work -- Opus here writes a near-constant ~500 bytes/poll
+# whether or not anyone is talking, so there's no usable signal in the
+# compressed bytes themselves. Instead, each poll shells out to `ffmpeg`
+# (installed via `pkg install ffmpeg`) to decode the recording-so-far to
+# raw 16-bit PCM and measures real RMS energy on just the newly-decoded
+# tail -- slower per poll (~0.1-0.3s) but the energy numbers are real.
+# Python 3.13 removed the `audioop` module, hence doing the RMS math by hand.
+FFMPEG_AVAILABLE = subprocess.run(
+    ["which", "ffmpeg"], capture_output=True, check=False
+).returncode == 0
+MIC_MAX_SECONDS = 15  # hard cap so a silent mic can't hang forever
+# Each poll spawns ffmpeg, and process-spawn overhead alone is ~0.6-0.8s on
+# this low-end device (measured) -- too short a poll interval means the
+# polling loop itself becomes the bottleneck, not the actual silence wait.
+MIC_POLL_INTERVAL = 1.5
+MIC_SILENCE_RMS_THRESHOLD = 500.0  # empirical; 16-bit PCM range is +-32768
+MIC_SILENCE_SECONDS_TO_STOP = 1.0  # how much trailing silence ends the turn
+
+
+def _decode_tail_rms(ogg_path: str, prev_duration_s: float) -> tuple[float, float]:
+    """Decode as much of the (possibly still-growing) ogg file as ffmpeg can
+    manage, and return (new_total_duration_s, rms_of_the_newly_decoded_tail).
+    Returns (prev_duration_s, 0.0) if nothing new could be decoded yet (e.g.
+    the file is still flushing its first page).
+    """
+    pcm_path = ogg_path + ".pcm"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", ogg_path,
+         "-f", "s16le", "-ar", "16000", "-ac", "1", pcm_path],
+        capture_output=True, timeout=5, check=False,
+    )
+    try:
+        data = Path(pcm_path).read_bytes()
+    except OSError:
+        return prev_duration_s, 0.0
+
+    total_duration_s = (len(data) // 2) / 16000
+    prev_sample_bytes = int(prev_duration_s * 16000) * 2
+    new_bytes = data[prev_sample_bytes:]
+    if len(new_bytes) < 2:
+        return total_duration_s, 0.0
+
+    usable_len = len(new_bytes) - (len(new_bytes) % 2)
+    samples = struct.unpack(f"<{usable_len // 2}h", new_bytes[:usable_len])
+    rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+    return total_duration_s, rms
+
+
 
 
 def bash(command: str) -> str:
@@ -46,29 +113,64 @@ def bash(command: str) -> str:
         return f"Error running command: {e}"
 
 
-def web_search(query: str) -> str:
-    """Basic, keyless web search using DuckDuckGo's instant-answer API.
+def _web_search_firecrawl(query: str) -> str:
+    key = settings.load()["firecrawl_api_key"] or os.environ.get("FIRECRAWL_API_KEY")
+    if not key:
+        raise RuntimeError("Set firecrawl_api_key in settings.json, or export FIRECRAWL_API_KEY")
+    resp = requests.post(
+        "https://api.firecrawl.dev/v2/search",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"query": query, "limit": 5},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("data", {}).get("web", [])
+    if not results:
+        return "No results found for that query."
+    lines = []
+    for r in results:
+        desc = " ".join(r.get("description", "").split())  # collapse to one line, strip markdown noise
+        if len(desc) > 200:
+            desc = desc[:200].rsplit(" ", 1)[0] + "..."
+        lines.append(f"- {r.get('title', '')}: {desc} ({r.get('url', '')})")
+    return "\n".join(lines)
 
-    Deliberately lightweight for v1 — no API key, no heavy scraping deps.
-    Upgrade path: swap this for a real search API once we need better recall.
+
+def _web_search_ddg(query: str) -> str:
+    """Basic, keyless web search using DuckDuckGo's instant-answer API --
+    only covers Wikipedia-style topic abstracts, not general queries (see
+    GitHub issue #11). Kept as a no-key fallback.
     """
+    resp = requests.get(
+        "https://api.duckduckgo.com/",
+        params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+        timeout=10,
+    )
+    data = resp.json()
+    abstract = data.get("AbstractText")
+    if abstract:
+        return abstract
+    related = data.get("RelatedTopics", [])
+    snippets = [r["Text"] for r in related if isinstance(r, dict) and r.get("Text")]
+    if snippets:
+        return "\n".join(snippets[:3])
+    return "No quick answer found for that query."
+
+
+def web_search(query: str) -> str:
+    """Search the web. Uses Firecrawl's /search API if a key is configured
+    (real general web results), falling back to DuckDuckGo's keyless
+    instant-answer API otherwise (Wikipedia-style topics only).
+    """
+    mood_bridge.set_mood("searching")
     try:
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=10,
-        )
-        data = resp.json()
-        abstract = data.get("AbstractText")
-        if abstract:
-            return abstract
-        related = data.get("RelatedTopics", [])
-        snippets = [r["Text"] for r in related if isinstance(r, dict) and r.get("Text")]
-        if snippets:
-            return "\n".join(snippets[:3])
-        return "No quick answer found for that query."
+        if settings.load()["firecrawl_api_key"] or os.environ.get("FIRECRAWL_API_KEY"):
+            return _web_search_firecrawl(query)
+        return _web_search_ddg(query)
     except Exception as e:
         return f"Search failed: {e}"
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def _play_audio(path: str) -> None:
@@ -91,14 +193,24 @@ def _play_audio(path: str) -> None:
 
 def speak(text: str) -> str:
     """Say something out loud through the speaker."""
-    out_path = str(Path(tempfile.gettempdir()) / f"walle_speak_{int(time.time())}.wav")
-    voice.speak(text, out_path)
-    _play_audio(out_path)
-    return f"(spoke): {text}"
+    mood_bridge.set_mood("speaking")
+    try:
+        out_path = str(Path(tempfile.gettempdir()) / f"walle_speak_{int(time.time())}.wav")
+        voice.speak(text, out_path)
+        _play_audio(out_path)
+        return f"(spoke): {text}"
+    finally:
+        mood_bridge.set_mood("idle")
 
 
-def mic_listen(seconds: int = MIC_RECORD_SECONDS_DEFAULT) -> str:
-    """Record from the microphone for a few seconds and transcribe it.
+def mic_listen(seconds: int | None = None) -> str:
+    """Record from the microphone and transcribe it, stopping automatically
+    once the user stops talking (voice-activity detection) instead of
+    always recording a fixed duration -- faster turnaround, and avoids both
+    clipping long utterances and padding short ones with dead air.
+
+    `seconds`, if given, is used as a hard cap instead of MIC_MAX_SECONDS;
+    the default is pure VAD-driven (recording ends ~1s after speech stops).
 
     Phone-only (Termux): uses `termux-microphone-record`, which requires the
     Termux:API app and microphone permission.
@@ -106,22 +218,68 @@ def mic_listen(seconds: int = MIC_RECORD_SECONDS_DEFAULT) -> str:
     if platform.system() == "Windows":
         return "mic_listen is only implemented for Termux/Android right now."
 
-    rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.wav")
-    start = subprocess.run(
-        ["termux-microphone-record", "-f", rec_path, "-l", str(seconds)],
-        capture_output=True, text=True, check=False,
-    )
-    time.sleep(seconds + 1)
-    subprocess.run(["termux-microphone-record", "-q"], check=False)
+    max_seconds = seconds or MIC_MAX_SECONDS
+    mood_bridge.set_mood("listening")
+    try:
+        rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.ogg")
+        start = subprocess.run(
+            ["termux-microphone-record", "-f", rec_path, "-l", str(max_seconds),
+             "-e", "opus", "-r", "16000", "-c", "1"],
+            capture_output=True, text=True, check=False,
+        )
 
-    if not Path(rec_path).exists():
-        # termux-microphone-record reports errors (e.g. missing RECORD_AUDIO
-        # permission) as JSON on stdout rather than a nonzero exit code, so
-        # surface that instead of a confusing downstream FileNotFoundError.
-        detail = start.stdout.strip() or start.stderr.strip() or "no recording was produced"
-        return f"mic_listen failed: {detail}"
+        heard_speech = False
+        silence_elapsed = 0.0
+        decoded_duration_s = 0.0
+        elapsed = 0.0
+        stopped_early = False
 
-    return voice.transcribe(rec_path)
+        while FFMPEG_AVAILABLE and elapsed < max_seconds:
+            time.sleep(MIC_POLL_INTERVAL)
+            elapsed += MIC_POLL_INTERVAL
+
+            decoded_duration_s, rms = _decode_tail_rms(rec_path, decoded_duration_s)
+
+            if rms >= MIC_SILENCE_RMS_THRESHOLD:
+                heard_speech = True
+                silence_elapsed = 0.0
+            elif heard_speech:
+                silence_elapsed += MIC_POLL_INTERVAL
+                if silence_elapsed >= MIC_SILENCE_SECONDS_TO_STOP:
+                    stopped_early = True
+                    break
+
+        if not FFMPEG_AVAILABLE:
+            # No ffmpeg to decode with -- fall back to just waiting out the
+            # full fixed duration rather than guessing from compressed bytes.
+            time.sleep(max_seconds)
+
+        if stopped_early:
+            subprocess.run(
+                ["termux-microphone-record", "-q"], capture_output=True, check=False
+            )
+        # Either way, give the recorder a moment to flush the final bytes.
+        time.sleep(0.3)
+
+        if not Path(rec_path).exists():
+            # termux-microphone-record reports errors (e.g. missing RECORD_AUDIO
+            # permission) as JSON on stdout rather than a nonzero exit code, so
+            # surface that instead of a confusing downstream FileNotFoundError.
+            detail = start.stdout.strip() or start.stderr.strip() or "no recording was produced"
+            return f"mic_listen failed: {detail}"
+
+        try:
+            return voice.transcribe(rec_path)
+        except Exception as e:
+            # A transcription-API failure (bad request, no internet, etc) is
+            # exactly as "mic_listen failed" to the caller as a recording
+            # failure -- run_voice_turn already knows how to react to that
+            # prefix with a friendly fallback instead of silently crashing.
+            return f"mic_listen failed: transcription error: {e}"
+        finally:
+            Path(rec_path + ".pcm").unlink(missing_ok=True)
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def remember(key: str, value: str) -> str:
@@ -146,24 +304,26 @@ def _require_termux(tool_name: str) -> str | None:
 def set_alarm(hour: int, minute: int, label: str = "") -> str:
     """Set a real system alarm via the phone's clock app (not a cron job --
     this survives even if Termux itself gets killed in the background).
+
+    Routed through the Flutter app's own SET_ALARM intent (see
+    bridge_server.dart's /alarm + MainActivity.kt) rather than firing it
+    from Termux directly, because Termux's manifest doesn't declare the
+    com.android.alarm.permission.SET_ALARM permission at all -- there's
+    nothing for `pm grant` to grant (confirmed: a direct `am start` attempt
+    gets a SecurityException naming that exact missing permission). The
+    Flutter app declares it for itself instead (see GitHub issue #12).
     """
-    if (err := _require_termux("set_alarm")) is not None:
-        return err
     try:
-        subprocess.run(
-            [
-                "am", "start", "-a", "android.intent.action.SET_ALARM",
-                "--ei", "android.intent.extra.alarm.HOUR", str(int(hour)),
-                "--ei", "android.intent.extra.alarm.MINUTES", str(int(minute)),
-                "--es", "android.intent.extra.alarm.MESSAGE", label,
-                "--ez", "android.intent.extra.alarm.SKIP_UI", "true",
-            ],
-            check=True, capture_output=True, text=True, timeout=10,
+        resp = requests.post(
+            f"{BRIDGE_BASE}/alarm",
+            json={"hour": int(hour), "minute": int(minute), "label": label},
+            timeout=10,
         )
+        resp.raise_for_status()
         suffix = f" ({label})" if label else ""
         return f"Alarm set for {hour:02d}:{minute:02d}{suffix}"
     except Exception as e:
-        return f"Failed to set alarm: {e}"
+        return f"set_alarm failed: could not reach the app's alarm bridge ({e})"
 
 
 _CRON_FIELD_RE = re.compile(r"^[0-9*/,-]+$")
@@ -222,7 +382,9 @@ def open_app(uri: str) -> str:
         return f"Failed to open '{uri}': {e}"
 
 
-_MEDIA_KEYCODES = {"play_pause": "85", "next": "87", "previous": "88"}
+_MEDIA_ACTIONS = {"play_pause", "next", "previous"}
+
+BRIDGE_BASE = "http://127.0.0.1:8099"
 
 
 def media_control(action: str) -> str:
@@ -230,27 +392,23 @@ def media_control(action: str) -> str:
     currently playing audio (Spotify, YouTube Music, etc) -- generic control
     with no per-app API or login needed.
 
-    Note: on a non-rooted phone, `input keyevent` may fail with a permission
-    error unless the device has granted Termux the INJECT_EVENTS permission
-    (one-time `adb shell pm grant com.termux android.permission.INJECT_EVENTS`
-    from a PC). If that's not set up, this tool will return a clear error
-    rather than silently doing nothing.
+    Routed through the Flutter app's own AudioManager.dispatchMediaKeyEvent
+    (see bridge_server.dart's /media + MainActivity.kt) rather than Termux's
+    `input keyevent`, because that needs the signature-level INJECT_EVENTS
+    permission, which isn't grantable to a third-party app like Termux on
+    this Android version at all (confirmed: `pm grant` itself refuses it --
+    see GitHub issue #10). The Flutter app doesn't need any special
+    permission for this API, since it's the same mechanism a Bluetooth
+    headset's media button uses.
     """
-    if (err := _require_termux("media_control")) is not None:
-        return err
-    code = _MEDIA_KEYCODES.get(action)
-    if code is None:
-        return f"Unknown media action '{action}'. Use one of: {', '.join(_MEDIA_KEYCODES)}."
+    if action not in _MEDIA_ACTIONS:
+        return f"Unknown media action '{action}'. Use one of: {', '.join(_MEDIA_ACTIONS)}."
     try:
-        subprocess.run(
-            ["input", "keyevent", code], check=True, capture_output=True, text=True, timeout=10
-        )
+        resp = requests.post(f"{BRIDGE_BASE}/media", json={"action": action}, timeout=10)
+        resp.raise_for_status()
         return f"Sent media action: {action}"
     except Exception as e:
-        return f"Failed to send media action (device may need INJECT_EVENTS permission): {e}"
-
-
-BRIDGE_BASE = "http://127.0.0.1:8099"
+        return f"media_control failed: could not reach the app's media bridge ({e})"
 
 
 def analyze_photo(prompt: str) -> str:
@@ -263,15 +421,19 @@ def analyze_photo(prompt: str) -> str:
     install. Being loopback-only, this also works regardless of any
     network-level isolation (e.g. mobile hotspot client isolation).
     """
+    mood_bridge.set_mood("taking_photo")
     try:
-        resp = requests.get(f"{BRIDGE_BASE}/photo", timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        return f"analyze_photo failed: could not reach the app's camera bridge ({e})"
+        try:
+            resp = requests.get(f"{BRIDGE_BASE}/photo", timeout=15)
+            resp.raise_for_status()
+        except Exception as e:
+            return f"analyze_photo failed: could not reach the app's camera bridge ({e})"
 
-    photo_path = str(Path(tempfile.gettempdir()) / f"walle_photo_{int(time.time())}.jpg")
-    Path(photo_path).write_bytes(resp.content)
-    return vision.analyze(photo_path, prompt)
+        photo_path = str(Path(tempfile.gettempdir()) / f"walle_photo_{int(time.time())}.jpg")
+        Path(photo_path).write_bytes(resp.content)
+        return vision.analyze(photo_path, prompt)
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def get_location() -> str:
@@ -346,7 +508,8 @@ Use this for anything involving files, system info, or automating tasks.
 - remember(key: str, value: str): Save a fact for later, e.g. a user preference.
 - recall(query: str): Look up previously remembered facts matching a query.
 - speak(text: str): Say something out loud through the phone's speaker.
-- mic_listen(seconds: int): Record from the microphone and transcribe what was said.
+- mic_listen(): Record from the microphone and transcribe what was said -- \
+automatically stops once you stop hearing speech, no need to guess a duration.
 - set_alarm(hour: int, minute: int, label: str): Set a real system alarm.
 - schedule_reminder(cron_expr: str, message: str): Schedule a recurring notification (cron syntax).
 - open_app(uri: str): Open an app or URL via an Android intent (e.g. a Spotify link).
