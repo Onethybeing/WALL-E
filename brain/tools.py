@@ -5,6 +5,8 @@ Keep this list short and sharp — every tool here is something the model
 might misuse, so bash especially should only ever run on a device you own.
 """
 
+import json
+import os
 import platform
 import re
 import shlex
@@ -16,10 +18,9 @@ from pathlib import Path
 
 import requests
 
-import json
-
 import memory
 import mood_bridge
+import settings
 import skills
 import vision
 import voice
@@ -112,28 +113,60 @@ def bash(command: str) -> str:
         return f"Error running command: {e}"
 
 
-def web_search(query: str) -> str:
-    """Basic, keyless web search using DuckDuckGo's instant-answer API.
+def _web_search_firecrawl(query: str) -> str:
+    key = settings.load()["firecrawl_api_key"] or os.environ.get("FIRECRAWL_API_KEY")
+    if not key:
+        raise RuntimeError("Set firecrawl_api_key in settings.json, or export FIRECRAWL_API_KEY")
+    resp = requests.post(
+        "https://api.firecrawl.dev/v2/search",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"query": query, "limit": 5},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("data", {}).get("web", [])
+    if not results:
+        return "No results found for that query."
+    lines = []
+    for r in results:
+        desc = " ".join(r.get("description", "").split())  # collapse to one line, strip markdown noise
+        if len(desc) > 200:
+            desc = desc[:200].rsplit(" ", 1)[0] + "..."
+        lines.append(f"- {r.get('title', '')}: {desc} ({r.get('url', '')})")
+    return "\n".join(lines)
 
-    Deliberately lightweight for v1 — no API key, no heavy scraping deps.
-    Upgrade path: swap this for a real search API once we need better recall.
+
+def _web_search_ddg(query: str) -> str:
+    """Basic, keyless web search using DuckDuckGo's instant-answer API --
+    only covers Wikipedia-style topic abstracts, not general queries (see
+    GitHub issue #11). Kept as a no-key fallback.
+    """
+    resp = requests.get(
+        "https://api.duckduckgo.com/",
+        params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+        timeout=10,
+    )
+    data = resp.json()
+    abstract = data.get("AbstractText")
+    if abstract:
+        return abstract
+    related = data.get("RelatedTopics", [])
+    snippets = [r["Text"] for r in related if isinstance(r, dict) and r.get("Text")]
+    if snippets:
+        return "\n".join(snippets[:3])
+    return "No quick answer found for that query."
+
+
+def web_search(query: str) -> str:
+    """Search the web. Uses Firecrawl's /search API if a key is configured
+    (real general web results), falling back to DuckDuckGo's keyless
+    instant-answer API otherwise (Wikipedia-style topics only).
     """
     mood_bridge.set_mood("searching")
     try:
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=10,
-        )
-        data = resp.json()
-        abstract = data.get("AbstractText")
-        if abstract:
-            return abstract
-        related = data.get("RelatedTopics", [])
-        snippets = [r["Text"] for r in related if isinstance(r, dict) and r.get("Text")]
-        if snippets:
-            return "\n".join(snippets[:3])
-        return "No quick answer found for that query."
+        if settings.load()["firecrawl_api_key"] or os.environ.get("FIRECRAWL_API_KEY"):
+            return _web_search_firecrawl(query)
+        return _web_search_ddg(query)
     except Exception as e:
         return f"Search failed: {e}"
     finally:

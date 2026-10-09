@@ -21,6 +21,7 @@ DEFAULTS = {
     "tts_provider": "gradium",      # TTS: "gradium" or "gemini"
     "gradium_api_key": "",          # one key covers both Gradium STT and TTS (shared credit pool)
     "tts_voice_id": "NbpkqMVS3CJeq2j8",  # Gradium's "Zoey" (US, conversational)
+    "firecrawl_api_key": "",        # real web_search results (see GitHub issue #11); falls back to DDG if empty
 }
 
 
