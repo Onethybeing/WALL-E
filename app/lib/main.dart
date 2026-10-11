@@ -4,11 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:flutter/services.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
-import 'package:rive/rive.dart' hide RadialGradient;
 
 import 'bridge_server.dart';
 import 'face_tracking.dart';
-import 'rive_eyes.dart';
+import 'scanner_visor.dart';
 // Wake-word: sherpa-onnx's keyword spotter crashed natively (Ort::Exception
 // in the encoder's Reshape node, Fatal signal 6/SIGABRT) and Porcupine's
 // plugin still hardcodes a conflicting compileSdkVersion -- both dropped.
@@ -33,16 +32,6 @@ import 'wake_word.dart';
 void overlayMain() {
   runApp(const _OverlayApp());
 }
-
-Color _overlayColorFor(Mood mood) => switch (mood) {
-      Mood.listening => Colors.cyanAccent,
-      Mood.thinking => Colors.purpleAccent,
-      Mood.searching => Colors.yellowAccent,
-      Mood.speaking => Colors.greenAccent,
-      Mood.takingPhoto => Colors.orangeAccent,
-      Mood.error => Colors.redAccent,
-      _ => Colors.white70,
-    };
 
 class _OverlayApp extends StatefulWidget {
   const _OverlayApp();
@@ -84,22 +73,30 @@ class _OverlayAppState extends State<_OverlayApp> with SingleTickerProviderState
     super.dispose();
   }
 
+  /// Same tap-to-trigger / tap-to-stop logic as the main screen's
+  /// _triggerVoiceTurn (see that method's doc comment) -- duplicated rather
+  /// than shared because this runs in a completely separate isolate/engine
+  /// with no access to _EyesScreenState. All three calls are loopback-only
+  /// HTTP, so they work regardless of which app/overlay is in front.
   Future<void> _onTap() async {
-    // Same trigger the main eyes screen's tap uses -- loopback-only, so
-    // this works regardless of which app/overlay is currently visible.
+    final String path = switch (_mood) {
+      Mood.idle => 'http://127.0.0.1:8100/trigger',
+      Mood.listening => 'http://127.0.0.1:8099/listen/stop',
+      _ => 'http://127.0.0.1:8100/stop',
+    };
     try {
       final client = HttpClient();
-      final request = await client.postUrl(Uri.parse('http://127.0.0.1:8100/trigger'));
+      final request = await client.postUrl(Uri.parse(path));
       await request.close();
       client.close();
     } catch (_) {
-      // Brain's trigger server isn't running -- nothing to show for this.
+      // Brain's trigger server (or the main app's bridge) isn't running --
+      // nothing to show for this in a tiny bubble.
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final color = _overlayColorFor(_mood);
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       home: Scaffold(
@@ -108,29 +105,9 @@ class _OverlayAppState extends State<_OverlayApp> with SingleTickerProviderState
           onTap: _onTap,
           behavior: HitTestBehavior.opaque,
           child: Center(
-            child: Container(
-              width: 56,
-              height: 56,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: Colors.black.withValues(alpha: 0.55),
-                boxShadow: [BoxShadow(color: color.withValues(alpha: 0.6), blurRadius: 18, spreadRadius: 1)],
-              ),
-              child: Center(
-                child: _mood == Mood.idle
-                    ? Container(
-                        width: 14,
-                        height: 14,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: color.withValues(alpha: 0.5 + (sin(_phase) + 1) / 2 * 0.3),
-                        ),
-                      )
-                    : Transform.scale(
-                        scale: 0.6,
-                        child: MoodIndicator(mood: _mood, color: color, phase: _phase),
-                      ),
-              ),
+            child: FittedBox(
+              fit: BoxFit.contain,
+              child: ScannerVisorFace(moodName: _mood.name, phase: _phase),
             ),
           ),
         ),
@@ -141,8 +118,7 @@ class _OverlayAppState extends State<_OverlayApp> with SingleTickerProviderState
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await RiveFile.initialize();
-  // Lock the app to landscape since the eyes are designed for a wide screen.
+  // Lock the app to landscape since the face is designed for a wide screen.
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
@@ -182,163 +158,6 @@ Mood? _moodFromBrainState(String state) => switch (state) {
       'error' => Mood.error,
       _ => null,
     };
-
-/// An accent color for each mood, used by the overlay in
-/// _EyesScreenState.build() -- the Rive rig itself has no mood animations
-/// (it's purely an eye-tracking rig), so mood is communicated via this
-/// overlay rather than by changing the eyes' own artwork.
-Color? _colorFor(Mood mood) => switch (mood) {
-      Mood.listening => Colors.cyanAccent,
-      Mood.thinking => Colors.purpleAccent,
-      Mood.searching => Colors.yellowAccent,
-      Mood.speaking => Colors.greenAccent,
-      Mood.takingPhoto => Colors.orangeAccent,
-      Mood.error => Colors.redAccent,
-      _ => null,
-    };
-
-/// A small per-mood animated indicator, replacing what used to be a plain
-/// text label ("listening...", "thinking...", etc) -- see GitHub issue #6.
-/// Driven by `phase`, a monotonically increasing value ticking at ~60fps
-/// (see _EyesScreenState._onTick), rather than its own AnimationController.
-class MoodIndicator extends StatelessWidget {
-  const MoodIndicator({super.key, required this.mood, required this.color, required this.phase});
-
-  final Mood mood;
-  final Color color;
-  final double phase;
-
-  @override
-  Widget build(BuildContext context) {
-    final shape = switch (mood) {
-      Mood.listening => _breathingRing(),
-      Mood.thinking => _bouncingDots(),
-      Mood.searching => _spinningArc(),
-      Mood.speaking => _equalizerBars(),
-      Mood.takingPhoto => _shutterPulse(),
-      Mood.error => _slowBlink(),
-      _ => null,
-    };
-    if (shape == null) return const SizedBox.shrink();
-    // A soft ambient glow behind every shape -- turns flat UI chips into
-    // something that reads as light rather than a widget.
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        boxShadow: [BoxShadow(color: color.withValues(alpha: 0.55), blurRadius: 28, spreadRadius: 2)],
-      ),
-      child: shape,
-    );
-  }
-
-  // A ring that breathes in and out, like something actively paying attention.
-  Widget _breathingRing() {
-    final pulse = (sin(phase) + 1) / 2; // 0..1
-    return Container(
-      width: 36 + pulse * 16,
-      height: 36 + pulse * 16,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        border: Border.all(color: color, width: 4),
-      ),
-    );
-  }
-
-  // Three dots bouncing in sequence, like a classic "thinking" indicator.
-  Widget _bouncingDots() {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: List.generate(3, (i) {
-        final bounce = (sin(phase * 2 - i * 0.8) + 1) / 2;
-        return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6),
-          child: Transform.translate(
-            offset: Offset(0, -bounce * 10),
-            child: Container(
-              width: 10,
-              height: 10,
-              decoration: BoxDecoration(shape: BoxShape.circle, color: color),
-            ),
-          ),
-        );
-      }),
-    );
-  }
-
-  // A partial ring that spins continuously, like a search/loading spinner.
-  Widget _spinningArc() {
-    return Transform.rotate(
-      angle: phase * 2,
-      child: SizedBox(
-        width: 36,
-        height: 36,
-        child: CustomPaint(painter: _ArcPainter(color: color)),
-      ),
-    );
-  }
-
-  // Vertical bars pulsing at different rates, like an audio equalizer.
-  Widget _equalizerBars() {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: List.generate(4, (i) {
-        final h = 8 + ((sin(phase * (2.5 + i * 0.9) + i) + 1) / 2) * 24;
-        return Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 3),
-          child: Container(
-            width: 6,
-            height: h,
-            decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(3)),
-          ),
-        );
-      }),
-    );
-  }
-
-  // A quick bright flash that fades, like a camera shutter.
-  Widget _shutterPulse() {
-    final flash = ((sin(phase * 3) + 1) / 2).clamp(0.0, 1.0);
-    return Container(
-      width: 40,
-      height: 40,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: color.withValues(alpha: 0.3 + flash * 0.7),
-      ),
-    );
-  }
-
-  // A slow, steady blink -- deliberately calmer than the others so an error
-  // doesn't feel as urgent/animated as an active task.
-  Widget _slowBlink() {
-    final blink = (sin(phase * 0.6) + 1) / 2;
-    return Container(
-      width: 36,
-      height: 36,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        border: Border.all(color: color.withValues(alpha: 0.4 + blink * 0.6), width: 4),
-      ),
-    );
-  }
-}
-
-class _ArcPainter extends CustomPainter {
-  _ArcPainter({required this.color});
-  final Color color;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 4
-      ..strokeCap = StrokeCap.round;
-    canvas.drawArc(Offset.zero & size, 0, pi * 1.3, false, paint);
-  }
-
-  @override
-  bool shouldRepaint(_ArcPainter oldDelegate) => oldDelegate.color != color;
-}
 
 /// The main screen: a black background with two animated eyes centered on it.
 class EyesScreen extends StatefulWidget {
@@ -535,53 +354,21 @@ class _EyesScreenState extends State<EyesScreen>
 
   @override
   Widget build(BuildContext context) {
-    final color = _colorFor(_mood);
     return Scaffold(
       backgroundColor: Colors.black,
       body: GestureDetector(
         onTap: _triggerVoiceTurn,
         behavior: HitTestBehavior.opaque,
-        child: Stack(
-          children: [
-            SizedBox.expand(
-              child: RiveEyes(lookOffset: _lookOffset),
-            ),
-            if (color != null)
-              IgnorePointer(
-                child: Stack(
-                  children: [
-                    // A soft colored vignette instead of a hard rectangular
-                    // border -- transparent at the center so the eyes stay
-                    // clear, breathing gently with the mood pulse towards
-                    // the edges. Replaces the old flat 6px frame.
-                    Positioned.fill(
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 500),
-                        decoration: BoxDecoration(
-                          gradient: RadialGradient(
-                            center: Alignment.center,
-                            radius: 1.2,
-                            colors: [
-                              color.withValues(alpha: 0),
-                              color.withValues(alpha: 0.22 + (sin(_pulsePhase) + 1) / 2 * 0.1),
-                            ],
-                            stops: const [0.45, 1.0],
-                          ),
-                        ),
-                      ),
-                    ),
-                    Positioned(
-                      bottom: 36,
-                      left: 0,
-                      right: 0,
-                      child: Center(
-                        child: MoodIndicator(mood: _mood, color: color, phase: _pulsePhase),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-          ],
+        child: Center(
+          // Mood is communicated by the visor's own color/segments now
+          // (see scanner_visor.dart), not a separate overlay indicator --
+          // the old Rive eyes had no mood animations of their own, which is
+          // why that overlay existed in the first place.
+          child: ScannerVisorFace(
+            moodName: _mood.name,
+            phase: _pulsePhase,
+            lookOffset: _lookOffset,
+          ),
         ),
       ),
     );

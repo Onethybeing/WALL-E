@@ -42,11 +42,6 @@ dependencies:
   permission_handler: ^11.3.1
   geolocator: ^13.0.2
 
-  # Eye-tracking animation, rendered from assets/rive/eyes.riv ("Eye Tracking"
-  # by sarahpuspdew, CC BY 4.0 -- https://rive.app/community/files/6680-12901-eye-tracking/)
-  rive: ^0.13.20
-  rive_common: ^0.4.15
-
   # Mic recording for mic_listen() (brain/tools.py), via bridge_server.dart's
   # /listen endpoint -- not Termux:API's RECORD_AUDIO, which `adb shell cmd
   # appops get com.termux.api` shows capped at AppOps mode "foreground" at
@@ -116,15 +111,11 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  assets:
-    - assets/rive/eyes.riv
-    # sherpa_kws model assets kept on disk (assets/sherpa_kws/) but not
-    # bundled while wake-word is disabled -- see pubspec dependencies above.
-    # - assets/sherpa_kws/encoder.onnx
-    # - assets/sherpa_kws/decoder.onnx
-    # - assets/sherpa_kws/joiner.onnx
-    # - assets/sherpa_kws/tokens.txt
-    # - assets/sherpa_kws/keywords.txt
+  # No bundled assets currently -- the sherpa-onnx keyword-spotter models
+  # that used to live under assets/sherpa_kws/ were for an approach dropped
+  # entirely (native crash, see wake_word.dart), and the Rive eye rig's
+  # assets/rive/eyes.riv was replaced by the scanner-visor character
+  # (scanner_visor.dart), which is drawn in code, not loaded from a file.
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

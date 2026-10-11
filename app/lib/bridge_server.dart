@@ -93,6 +93,14 @@ class BridgeServer {
         await _handleAlarm(request);
       } else if (request.uri.path == '/listen') {
         await _handleListen(request);
+      } else if (request.uri.path == '/listen/stop' && request.method == 'POST') {
+        // Same effect as a second tap on the main screen while listening
+        // (stopListening() below) -- exposed over HTTP so the floating
+        // overlay's own isolate/engine can reach it too, since it has no
+        // direct access to this BridgeServer instance.
+        stopListening();
+        request.response.statusCode = HttpStatus.ok;
+        await request.response.close();
       } else if (request.uri.path == '/screen/gesture' && request.method == 'POST') {
         await _handleScreenGesture(request);
       } else if (request.uri.path == '/screen/action' && request.method == 'POST') {
@@ -297,8 +305,11 @@ class BridgeServer {
     // renders *behind* the system nav bar's higher z-order there. Using
     // topLeft instead keeps it clear of that area.
     await FlutterOverlayWindow.showOverlay(
-      height: 80,
-      width: 80,
+      // Wider than tall to fit the scanner-visor dome's silhouette (see
+      // ScannerVisorFace/_OverlayApp in main.dart) -- a square bubble
+      // cropped it awkwardly on either side.
+      height: 72,
+      width: 112,
       alignment: OverlayAlignment.topLeft,
       flag: OverlayFlag.defaultFlag,
       enableDrag: true,
