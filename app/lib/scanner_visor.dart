@@ -64,8 +64,6 @@ _VisorStyle _styleFor(String mood) => switch (mood) {
       'speaking' => const _VisorStyle(Color(0xFF6FE6A3), 20, 4.0, 1.0),
       'error' => const _VisorStyle(Color(0xFFE65C5C), 5, 0.6, 0.9),
       'takingPhoto' || 'taking_photo' => const _VisorStyle(Color(0xFFFFFFFF), 24, 7.0, 1.0),
-      'happy' => const _VisorStyle(Color(0xFFE0A868), 18, 2.0, 0.9),
-      'surprised' => const _VisorStyle(Color(0xFFE6C84D), 26, 5.0, 1.0),
       _ => _idle,
     };
 

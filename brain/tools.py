@@ -29,8 +29,6 @@ MAX_OUTPUT_CHARS = 4000
 MIC_MAX_SECONDS = 15  # hard cap so a silent mic can't hang forever -- see mic_listen
 
 
-
-
 def bash(command: str) -> str:
     """Run a shell command on this device and return its output."""
     try:
@@ -571,7 +569,13 @@ def analyze_photo(prompt: str) -> str:
 
         photo_path = str(Path(tempfile.gettempdir()) / f"walle_photo_{int(time.time())}.jpg")
         Path(photo_path).write_bytes(resp.content)
-        return vision.analyze(photo_path, prompt)
+        try:
+            return vision.analyze(photo_path, prompt)
+        finally:
+            # mic_listen() already does this for its own temp recordings --
+            # this one was missing it, leaving a JPEG behind on every single
+            # analyze_photo call with nothing ever cleaning them up.
+            Path(photo_path).unlink(missing_ok=True)
     finally:
         mood_bridge.set_mood("idle")
 

@@ -30,23 +30,27 @@ def _connect():
 
 def remember(key: str, value: str) -> str:
     conn = _connect()
-    with conn:
-        conn.execute(
-            "INSERT INTO memories (key, value, created_at) VALUES (?, ?, ?)",
-            (key, value, time.time()),
-        )
-    conn.close()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO memories (key, value, created_at) VALUES (?, ?, ?)",
+                (key, value, time.time()),
+            )
+    finally:
+        conn.close()
     return f"Remembered: {key} = {value}"
 
 
 def recall(query: str, limit: int = 5) -> str:
     conn = _connect()
-    rows = conn.execute(
-        "SELECT key, value FROM memories WHERE key LIKE ? OR value LIKE ? "
-        "ORDER BY created_at DESC LIMIT ?",
-        (f"%{query}%", f"%{query}%", limit),
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            "SELECT key, value FROM memories WHERE key LIKE ? OR value LIKE ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (f"%{query}%", f"%{query}%", limit),
+        ).fetchall()
+    finally:
+        conn.close()
     if not rows:
         return "No matching memories found."
     return "\n".join(f"- {k}: {v}" for k, v in rows)
@@ -55,9 +59,10 @@ def recall(query: str, limit: int = 5) -> str:
 def recent(limit: int = 10) -> list[tuple[str, str]]:
     """Used to seed the system prompt with a bit of standing context."""
     conn = _connect()
-    rows = conn.execute(
-        "SELECT key, value FROM memories ORDER BY created_at DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    conn.close()
-    return rows
+    try:
+        return conn.execute(
+            "SELECT key, value FROM memories ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()

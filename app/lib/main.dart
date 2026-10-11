@@ -139,12 +139,11 @@ class WallEApp extends StatelessWidget {
   }
 }
 
-/// The pet's current expression. `idle`/`happy`/`surprised`/`thinking` are
-/// driven by the tap-to-cycle demo; `searching`/`speaking`/`takingPhoto` are
-/// driven for real by the brain via BridgeServer.moodNotifier (see
-/// _EyesScreenState's bridge listener below and brain/mood_bridge.py on the
-/// Python side).
-enum Mood { idle, happy, surprised, thinking, listening, searching, speaking, takingPhoto, error }
+/// The pet's current expression, driven by the brain via
+/// BridgeServer.moodNotifier (see _EyesScreenState's bridge listener below
+/// and brain/mood_bridge.py's VALID_STATES on the Python side -- keep both
+/// lists in sync).
+enum Mood { idle, thinking, listening, searching, speaking, takingPhoto, error }
 
 /// Maps the state strings the brain POSTs to /mood (brain/mood_bridge.py's
 /// VALID_STATES) onto the Mood enum above. Keep both lists in sync.
@@ -298,8 +297,9 @@ class _EyesScreenState extends State<EyesScreen>
 
   /// Tapping the eyes tells the brain (running its own trigger server in
   /// Termux, see agent.py's `serve()`/_TriggerHandler) to start one full
-  /// voice turn: listen, think, speak. This is the manual stand-in for the
-  /// wake-word trigger until that's working again (see wake_word.dart).
+  /// voice turn: listen, think, speak -- the manual alternative to saying
+  /// the wake word (see wake_word.dart), both landing here or in
+  /// _onWakeWordDetected respectively.
   ///
   /// A second tap *while already listening* stops the recording right
   /// away instead of starting a new turn -- this device's mic noise floor

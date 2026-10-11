@@ -34,6 +34,10 @@ class NemotronClient:
             },
             timeout=60,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            # Same reasoning as groq_client.py/gemini_client.py -- bare
+            # raise_for_status() discards the response body, which for a
+            # 400 is almost always the one piece of info that explains why.
+            raise RuntimeError(f"Nemotron API error {resp.status_code}: {resp.text}")
         data = resp.json()
         return data["choices"][0]["message"]["content"]

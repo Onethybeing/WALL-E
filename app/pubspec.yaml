@@ -81,9 +81,6 @@ dependencies:
   # natively (its own docs say so), so wake_word.dart works around that
   # with a restart-on-timeout loop instead -- see its doc comment.
   speech_to_text: ^7.5.0
-  # sherpa_onnx: ^1.13.8
-  # path: ^1.9.1
-
 dev_dependencies:
   flutter_test:
     sdk: flutter

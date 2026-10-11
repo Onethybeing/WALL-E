@@ -12,6 +12,9 @@ app/.flutter-plugins
 app/.flutter-plugins-dependencies
 app/android/.gradle/
 app/android/local.properties
+# build.gradle.kts redirects most plugin build output to app/build/, but
+# the root Gradle project's own output still lands here.
+app/android/build/
 app/*.iml
 
 # OS noise
