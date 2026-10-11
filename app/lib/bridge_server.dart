@@ -425,7 +425,6 @@ class BridgeServer {
     var heardSpeech = false;
     var silenceSeconds = 0.0;
     final doneCompleter = Completer<void>();
-    _activeListenStop = doneCompleter;
 
     // A fixed RMS threshold doesn't generalize across devices/mic gain --
     // measured this device's own raw-PCM noise floor sitting at ~900-1600,
@@ -439,41 +438,50 @@ class BridgeServer {
     double? speechThreshold;
     final recordingClock = Stopwatch()..start();
 
-    final stream = await recorder.startStream(
-      const RecordConfig(encoder: AudioEncoder.pcm16bits, sampleRate: 16000, numChannels: 1),
-    );
-    late final StreamSubscription<Uint8List> sub;
-    sub = stream.listen((chunk) {
-      pcm.add(chunk);
-      final rms = _pcm16Rms(chunk);
+    // Wrapped in try/finally so a thrown exception anywhere in here (e.g.
+    // startStream() itself failing because another recording is somehow
+    // already in flight) can't leave the mic open or _activeListenStop
+    // pointing at a completer nothing will ever resolve -- both used to be
+    // possible since cleanup only ran on the normal-completion path.
+    StreamSubscription<Uint8List>? sub;
+    try {
+      final stream = await recorder.startStream(
+        const RecordConfig(encoder: AudioEncoder.pcm16bits, sampleRate: 16000, numChannels: 1),
+      );
+      _activeListenStop = doneCompleter;
+      sub = stream.listen((chunk) {
+        pcm.add(chunk);
+        final rms = _pcm16Rms(chunk);
 
-      if (speechThreshold == null) {
-        calibrationRms.add(rms);
-        if (recordingClock.elapsed >= _calibrationWindow) {
-          final noiseFloor = calibrationRms.reduce((a, b) => a + b) / calibrationRms.length;
-          speechThreshold = (noiseFloor * 2.2).clamp(400.0, 3000.0);
+        if (speechThreshold == null) {
+          calibrationRms.add(rms);
+          if (recordingClock.elapsed >= _calibrationWindow) {
+            final noiseFloor = calibrationRms.reduce((a, b) => a + b) / calibrationRms.length;
+            speechThreshold = (noiseFloor * 2.2).clamp(400.0, 3000.0);
+          }
+          return; // VAD doesn't evaluate until calibration finishes
         }
-        return; // VAD doesn't evaluate until calibration finishes
-      }
 
-      if (rms > speechThreshold!) {
-        heardSpeech = true;
-        silenceSeconds = 0;
-      } else if (heardSpeech) {
-        // Chunk duration varies by platform, so measure it rather than
-        // assuming a fixed size like the old amplitude-poll version did.
-        silenceSeconds += chunk.length / 2 / 16000;
-        if (silenceSeconds >= _silenceSecondsToStop) {
-          if (!doneCompleter.isCompleted) doneCompleter.complete();
+        if (rms > speechThreshold!) {
+          heardSpeech = true;
+          silenceSeconds = 0;
+        } else if (heardSpeech) {
+          // Chunk duration varies by platform, so measure it rather than
+          // assuming a fixed size like the old amplitude-poll version did.
+          silenceSeconds += chunk.length / 2 / 16000;
+          if (silenceSeconds >= _silenceSecondsToStop) {
+            if (!doneCompleter.isCompleted) doneCompleter.complete();
+          }
         }
-      }
-    });
+      });
 
-    final timeout = Future.delayed(Duration(seconds: maxSeconds));
-    await Future.any([doneCompleter.future, timeout]);
-    if (identical(_activeListenStop, doneCompleter)) _activeListenStop = null;
-    await sub.cancel();
-    await recorder.stop();
+      final timeout = Future.delayed(Duration(seconds: maxSeconds));
+      await Future.any([doneCompleter.future, timeout]);
+    } finally {
+      if (identical(_activeListenStop, doneCompleter)) _activeListenStop = null;
+      await sub?.cancel();
+      await recorder.stop();
+    }
 
     final wavBytes = _wrapPcmAsWav(pcm.takeBytes(), sampleRate: 16000, numChannels: 1);
     request.response.headers.contentType = ContentType('audio', 'wav');

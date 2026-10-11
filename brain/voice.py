@@ -131,27 +131,33 @@ def _transcribe_gradium(audio_path: str) -> str:
         timeout=30,
         stream=True,
     )
-    if not resp.ok:
-        raise RuntimeError(f"Gradium STT error {resp.status_code}: {resp.text}")
+    # resp is a streaming connection (stream=True) -- only the timeout
+    # branch used to close it, so any other exception out of this loop
+    # (malformed JSON, a message missing an expected key) leaked the
+    # underlying socket instead of returning it to the connection pool.
+    try:
+        if not resp.ok:
+            raise RuntimeError(f"Gradium STT error {resp.status_code}: {resp.text}")
 
-    pieces = []
-    deadline = time.monotonic() + STT_TOTAL_DEADLINE_S
-    for line in resp.iter_lines(decode_unicode=True):
-        if time.monotonic() > deadline:
-            resp.close()
-            raise RuntimeError(
-                f"Gradium STT stream exceeded {STT_TOTAL_DEADLINE_S}s without finishing"
-            )
-        if not line:
-            continue
-        msg = json.loads(line)
-        if msg.get("type") == "text":
-            pieces.append(msg["text"])
-        elif msg.get("type") == "error":
-            raise RuntimeError(f"Gradium STT error: {msg.get('message')}")
-        elif msg.get("type") == "end_of_stream":
-            break
-    return " ".join(pieces).strip()
+        pieces = []
+        deadline = time.monotonic() + STT_TOTAL_DEADLINE_S
+        for line in resp.iter_lines(decode_unicode=True):
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Gradium STT stream exceeded {STT_TOTAL_DEADLINE_S}s without finishing"
+                )
+            if not line:
+                continue
+            msg = json.loads(line)
+            if msg.get("type") == "text":
+                pieces.append(msg["text"])
+            elif msg.get("type") == "error":
+                raise RuntimeError(f"Gradium STT error: {msg.get('message')}")
+            elif msg.get("type") == "end_of_stream":
+                break
+        return " ".join(pieces).strip()
+    finally:
+        resp.close()
 
 
 def speak(text: str, out_path: str) -> str:

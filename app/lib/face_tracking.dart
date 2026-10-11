@@ -85,18 +85,28 @@ class FaceTracker {
     }
   }
 
-  // The camera sensor's orientation is a fixed hardware property measured
+  // The camera sensor's orientation is a fixed hardware property reported
+  // by CameraDescription.sensorOrientation -- ML Kit needs it to know which
+  // way is "up" in the raw frame, independent of the device's own rotation.
   InputImage? _toInputImage(CameraImage image) {
     final camera = _controller?.description;
     if (camera == null) return null;
 
-    final bytes = image.planes.fold<List<int>>(
-      [],
-      (acc, plane) => acc..addAll(plane.bytes),
-    );
+    // Runs on every camera frame while face tracking is active, so avoid
+    // boxing each byte into a growable List<int> (the previous fold+addAll)
+    // and then copying that into a Uint8List -- two full passes with every
+    // byte individually boxed. A single preallocated Uint8List filled via
+    // setRange does the same plane concatenation with one typed-data copy.
+    final totalBytes = image.planes.fold<int>(0, (sum, plane) => sum + plane.bytes.length);
+    final bytes = Uint8List(totalBytes);
+    var offset = 0;
+    for (final plane in image.planes) {
+      bytes.setRange(offset, offset + plane.bytes.length, plane.bytes);
+      offset += plane.bytes.length;
+    }
 
     return InputImage.fromBytes(
-      bytes: Uint8List.fromList(bytes),
+      bytes: bytes,
       metadata: InputImageMetadata(
         size: Size(image.width.toDouble(), image.height.toDouble()),
         rotation: InputImageRotationValue.fromRawValue(camera.sensorOrientation) ??

@@ -77,12 +77,10 @@ class WakeWordListener {
     if (!_running || _paused) return;
     await _speech.listen(
       onResult: _onResult,
-      listenFor: const Duration(seconds: 30),
-      pauseFor: const Duration(seconds: 5),
-      partialResults: true,
-      cancelOnError: true,
       listenOptions: stt.SpeechListenOptions(
         listenMode: stt.ListenMode.confirmation,
+        listenFor: const Duration(seconds: 30),
+        pauseFor: const Duration(seconds: 5),
         partialResults: true,
         cancelOnError: true,
       ),

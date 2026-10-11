@@ -27,7 +27,7 @@ class _FallbackClient:
             return self.primary.chat(messages, temperature=temperature)
         except Exception as e:
             print(f"primary LLM ({type(self.primary).__name__}) failed, "
-                  f"falling back to Gemini: {e}")
+                  f"falling back to {type(self.fallback).__name__}: {e}")
             return self.fallback.chat(messages, temperature=temperature)
 
 
