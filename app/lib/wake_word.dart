@@ -33,6 +33,19 @@ class WakeWordListener {
   bool _paused = false; // true while a real voice turn owns the mic
   Timer? _restartTimer;
   int _consecutiveErrors = 0;
+  bool _lastErrorWasBenign = true;
+
+  // error_no_match/error_speech_timeout just mean "nothing was said" --
+  // completely normal in a quiet room, not a failure to recover from. The
+  // first version restarted these as fast as real failures, which meant the
+  // system's mic-in-use indicator flickered on/off every few seconds with
+  // no one around to notice there even was a wake word to say (reported
+  // live: "the mic is getting on and off again and again"). A flat,
+  // unhurried delay for this specific case cuts that flicker rate way down
+  // without weakening recovery from an actual stuck/erroring recognizer,
+  // which still backs off exponentially below.
+  static const _idleRestartDelay = Duration(seconds: 7);
+  static const _benignErrorCodes = {'error_no_match', 'error_speech_timeout'};
 
   static const List<String> _wakePhrases = [
     'wall-e', 'wall e', 'walle', 'hey wall-e', 'hey wall e', 'hey walle',
@@ -78,6 +91,7 @@ class WakeWordListener {
 
   void _onResult(dynamic result) {
     _consecutiveErrors = 0;
+    _lastErrorWasBenign = true;
     final heard = (result.recognizedWords as String).toLowerCase();
     if (_wakePhrases.any((phrase) => heard.contains(phrase))) {
       onWake();
@@ -85,6 +99,13 @@ class WakeWordListener {
   }
 
   void _onError(dynamic error) {
+    final code = error.errorMsg as String?;
+    debugPrint('WakeWordListener error: $code');
+    if (code != null && _benignErrorCodes.contains(code)) {
+      _lastErrorWasBenign = true;
+      _consecutiveErrors = 0; // just silence, not a failure -- don't escalate backoff
+      return;
+    }
     // Android's SpeechRecognizer throws error_busy if a new session starts
     // before the previous one has fully torn down, and error_client for a
     // handful of other transient reasons -- restarting immediately on every
@@ -92,7 +113,7 @@ class WakeWordListener {
     // that just regenerated the same errors (confirmed live: dozens of
     // error_busy/error_client lines a second in logcat). The exponential
     // backoff below, capped at 5s, lets the recognizer actually settle.
-    debugPrint('WakeWordListener error: ${error.errorMsg}');
+    _lastErrorWasBenign = false;
     _consecutiveErrors++;
   }
 
@@ -109,6 +130,10 @@ class WakeWordListener {
 
   void _scheduleRestart() {
     _restartTimer?.cancel();
+    if (_lastErrorWasBenign) {
+      _restartTimer = Timer(_idleRestartDelay, _listenOnce);
+      return;
+    }
     final backoffMs = (300 * (1 << _consecutiveErrors.clamp(0, 4))).clamp(300, 5000);
     _restartTimer = Timer(Duration(milliseconds: backoffMs), _listenOnce);
   }
