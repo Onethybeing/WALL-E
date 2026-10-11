@@ -42,13 +42,52 @@ dependencies:
   permission_handler: ^11.3.1
   geolocator: ^13.0.2
 
-  # Wake-word (porcupine_flutter) is temporarily disabled: its bundled
-  # flutter_voice_processor dependency hardcodes compileSdk 31, which
-  # conflicts with the newer AndroidX versions camera/mlkit pull in --
-  # an upstream packaging issue, not something fixable from this project.
-  # See lib/wake_word.dart -- the integration code is ready to re-enable
-  # once Picovoice ships a fix (or we swap to a different wake-word lib).
-  # porcupine_flutter: ^4.0.0
+  # Eye-tracking animation, rendered from assets/rive/eyes.riv ("Eye Tracking"
+  # by sarahpuspdew, CC BY 4.0 -- https://rive.app/community/files/6680-12901-eye-tracking/)
+  rive: ^0.13.20
+  rive_common: ^0.4.15
+
+  # Mic recording for mic_listen() (brain/tools.py), via bridge_server.dart's
+  # /listen endpoint -- not Termux:API's RECORD_AUDIO, which `adb shell cmd
+  # appops get com.termux.api` shows capped at AppOps mode "foreground" at
+  # the *uid* level (can't be overridden per-package) on this device/ROM,
+  # silently returning zeroed/empty audio instead of erroring. Same root
+  # cause already worked around for camera (analyze_photo) and location
+  # (get_location) -- WALL-E's own RECORD_AUDIO AppOps is a healthy "allow"
+  # (confirmed via the same adb command), so recording through this app
+  # instead actually works.
+  record: ^6.1.1
+  path_provider: ^2.1.5
+
+  # Persistent "Dynamic Island"-style overlay -- stays visible system-wide,
+  # not just while the eyes screen is in the foreground. Renders a second,
+  # separate Flutter engine into an Android overlay window (SYSTEM_ALERT_WINDOW),
+  # which -- like the Accessibility Service -- can't be silently granted;
+  # the person has to approve "display over other apps" manually.
+  #
+  # NOTE: tried flutter_overlay_window_plus first -- its OverlayService.java
+  # turned out to be a plain native View/TextView overlay, not an actual
+  # Flutter engine, so overlayTitle/overlayContent are just text, not a
+  # real widget tree. flutter_overlay_window (no "_plus") is the original,
+  # genuinely renders a second FlutterEngine via the documented
+  # @pragma("vm:entry-point") entry point.
+  flutter_overlay_window: ^0.5.0
+
+  # Wake-word, take 3: sherpa-onnx's native keyword spotter crashed
+  # reproducibly (Ort::Exception reshape error, SIGABRT -- genuine
+  # model/runtime incompatibility, confirmed not fixable by adjusting our
+  # integration). Porcupine was tried next and dropped for a compileSdk 31
+  # conflict with camera/mlkit's AndroidX requirements -- re-checked its
+  # current GitHub source (Dec 2025 release) and it still hardcodes
+  # `compileSdkVersion 31`, so that's still blocked upstream, unfixed.
+  # speech_to_text wraps Android's own SpeechRecognizer -- no native model,
+  # no compileSdk conflict (just needs compileSdkVersion 31+, which this
+  # app already has). It doesn't support true continuous listening
+  # natively (its own docs say so), so wake_word.dart works around that
+  # with a restart-on-timeout loop instead -- see its doc comment.
+  speech_to_text: ^7.5.0
+  # sherpa_onnx: ^1.13.8
+  # path: ^1.9.1
 
 dev_dependencies:
   flutter_test:
@@ -60,6 +99,11 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.3
+
+flutter_launcher_icons:
+  android: true
+  image_path: "assets/icon_source.png"
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -72,10 +116,15 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  assets:
+    - assets/rive/eyes.riv
+    # sherpa_kws model assets kept on disk (assets/sherpa_kws/) but not
+    # bundled while wake-word is disabled -- see pubspec dependencies above.
+    # - assets/sherpa_kws/encoder.onnx
+    # - assets/sherpa_kws/decoder.onnx
+    # - assets/sherpa_kws/joiner.onnx
+    # - assets/sherpa_kws/tokens.txt
+    # - assets/sherpa_kws/keywords.txt
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

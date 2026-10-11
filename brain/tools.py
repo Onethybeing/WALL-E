@@ -5,6 +5,8 @@ Keep this list short and sharp — every tool here is something the model
 might misuse, so bash especially should only ever run on a device you own.
 """
 
+import json
+import os
 import platform
 import re
 import shlex
@@ -15,16 +17,18 @@ from pathlib import Path
 
 import requests
 
-import json
-
 import memory
+import mood_bridge
+import settings
 import skills
 import vision
 import voice
 
 BASH_TIMEOUT_SECONDS = 30
 MAX_OUTPUT_CHARS = 4000
-MIC_RECORD_SECONDS_DEFAULT = 5
+MIC_MAX_SECONDS = 15  # hard cap so a silent mic can't hang forever -- see mic_listen
+
+
 
 
 def bash(command: str) -> str:
@@ -46,29 +50,64 @@ def bash(command: str) -> str:
         return f"Error running command: {e}"
 
 
-def web_search(query: str) -> str:
-    """Basic, keyless web search using DuckDuckGo's instant-answer API.
+def _web_search_firecrawl(query: str) -> str:
+    key = settings.load()["firecrawl_api_key"] or os.environ.get("FIRECRAWL_API_KEY")
+    if not key:
+        raise RuntimeError("Set firecrawl_api_key in settings.json, or export FIRECRAWL_API_KEY")
+    resp = requests.post(
+        "https://api.firecrawl.dev/v2/search",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"query": query, "limit": 5},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("data", {}).get("web", [])
+    if not results:
+        return "No results found for that query."
+    lines = []
+    for r in results:
+        desc = " ".join(r.get("description", "").split())  # collapse to one line, strip markdown noise
+        if len(desc) > 200:
+            desc = desc[:200].rsplit(" ", 1)[0] + "..."
+        lines.append(f"- {r.get('title', '')}: {desc} ({r.get('url', '')})")
+    return "\n".join(lines)
 
-    Deliberately lightweight for v1 — no API key, no heavy scraping deps.
-    Upgrade path: swap this for a real search API once we need better recall.
+
+def _web_search_ddg(query: str) -> str:
+    """Basic, keyless web search using DuckDuckGo's instant-answer API --
+    only covers Wikipedia-style topic abstracts, not general queries (see
+    GitHub issue #11). Kept as a no-key fallback.
     """
+    resp = requests.get(
+        "https://api.duckduckgo.com/",
+        params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+        timeout=10,
+    )
+    data = resp.json()
+    abstract = data.get("AbstractText")
+    if abstract:
+        return abstract
+    related = data.get("RelatedTopics", [])
+    snippets = [r["Text"] for r in related if isinstance(r, dict) and r.get("Text")]
+    if snippets:
+        return "\n".join(snippets[:3])
+    return "No quick answer found for that query."
+
+
+def web_search(query: str) -> str:
+    """Search the web. Uses Firecrawl's /search API if a key is configured
+    (real general web results), falling back to DuckDuckGo's keyless
+    instant-answer API otherwise (Wikipedia-style topics only).
+    """
+    mood_bridge.set_mood("searching")
     try:
-        resp = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=10,
-        )
-        data = resp.json()
-        abstract = data.get("AbstractText")
-        if abstract:
-            return abstract
-        related = data.get("RelatedTopics", [])
-        snippets = [r["Text"] for r in related if isinstance(r, dict) and r.get("Text")]
-        if snippets:
-            return "\n".join(snippets[:3])
-        return "No quick answer found for that query."
+        if settings.load()["firecrawl_api_key"] or os.environ.get("FIRECRAWL_API_KEY"):
+            return _web_search_firecrawl(query)
+        return _web_search_ddg(query)
     except Exception as e:
         return f"Search failed: {e}"
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def _play_audio(path: str) -> None:
@@ -91,37 +130,89 @@ def _play_audio(path: str) -> None:
 
 def speak(text: str) -> str:
     """Say something out loud through the speaker."""
-    out_path = str(Path(tempfile.gettempdir()) / f"walle_speak_{int(time.time())}.wav")
-    voice.speak(text, out_path)
-    _play_audio(out_path)
-    return f"(spoke): {text}"
+    mood_bridge.set_mood("speaking")
+    try:
+        out_path = str(Path(tempfile.gettempdir()) / f"walle_speak_{int(time.time())}.wav")
+        voice.speak(text, out_path)
+        # A tap mid-turn (see agent.py's POST /stop) may have landed while
+        # synthesis was in flight -- don't start playing audio the person
+        # already asked to stop.
+        if mood_bridge.stop_requested.is_set():
+            return "(spoke, but playback skipped: stop requested)"
+        _play_audio(out_path)
+        return f"(spoke): {text}"
+    finally:
+        mood_bridge.set_mood("idle")
 
 
-def mic_listen(seconds: int = MIC_RECORD_SECONDS_DEFAULT) -> str:
-    """Record from the microphone for a few seconds and transcribe it.
-
-    Phone-only (Termux): uses `termux-microphone-record`, which requires the
-    Termux:API app and microphone permission.
+def stop_speaking() -> str:
+    """Stop any audio currently playing and cut short the rest of the
+    current voice turn -- the brain-side half of a second tap on the eyes
+    while WALL-E is speaking or thinking (see main.dart's
+    _triggerVoiceTurn and agent.py's POST /stop). Runs on the trigger
+    server's own thread, not the turn's thread, so it works even while that
+    thread is stuck inside a blocking network call.
     """
+    mood_bridge.stop_requested.set()
     if platform.system() == "Windows":
-        return "mic_listen is only implemented for Termux/Android right now."
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(New-Object -ComObject WMPlayer.OCX).controls.stop()"],
+            check=False,
+        )
+    else:
+        subprocess.run(["termux-media-player", "stop"], check=False)
+    mood_bridge.set_mood("idle")
+    return "(stopped)"
 
-    rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.wav")
-    start = subprocess.run(
-        ["termux-microphone-record", "-f", rec_path, "-l", str(seconds)],
-        capture_output=True, text=True, check=False,
-    )
-    time.sleep(seconds + 1)
-    subprocess.run(["termux-microphone-record", "-q"], check=False)
 
-    if not Path(rec_path).exists():
-        # termux-microphone-record reports errors (e.g. missing RECORD_AUDIO
-        # permission) as JSON on stdout rather than a nonzero exit code, so
-        # surface that instead of a confusing downstream FileNotFoundError.
-        detail = start.stdout.strip() or start.stderr.strip() or "no recording was produced"
-        return f"mic_listen failed: {detail}"
+def mic_listen(seconds: int | None = None) -> str:
+    """Record from the microphone and transcribe it, stopping automatically
+    once the user stops talking (voice-activity detection) instead of
+    always recording a fixed duration -- faster turnaround, and avoids both
+    clipping long utterances and padding short ones with dead air.
 
-    return voice.transcribe(rec_path)
+    `seconds`, if given, is used as a hard cap instead of MIC_MAX_SECONDS;
+    the default is pure VAD-driven (recording ends ~1s after speech stops).
+
+    Routed through the Flutter app's own mic recording (bridge_server.dart's
+    /listen) rather than termux-microphone-record: `adb shell cmd appops get
+    com.termux.api` shows RECORD_AUDIO capped at AppOps mode "foreground" at
+    the *uid* level on this device/ROM (confirmed not overridable per-package
+    either), which silently hands back empty/zeroed audio instead of
+    erroring -- termux-microphone-record "succeeds" while actually capturing
+    nothing. This app's own RECORD_AUDIO AppOps is a healthy "allow" by
+    contrast (same root cause and same fix pattern as analyze_photo and
+    get_location before it).
+    """
+    max_seconds = seconds or MIC_MAX_SECONDS
+    mood_bridge.set_mood("listening")
+    try:
+        try:
+            resp = requests.get(
+                f"{BRIDGE_BASE}/listen",
+                params={"max_seconds": max_seconds},
+                timeout=max_seconds + 10,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            return f"mic_listen failed: could not reach the app's mic bridge ({e})"
+
+        rec_path = str(Path(tempfile.gettempdir()) / f"walle_listen_{int(time.time())}.wav")
+        Path(rec_path).write_bytes(resp.content)
+
+        try:
+            return voice.transcribe(rec_path)
+        except Exception as e:
+            # A transcription-API failure (bad request, no internet, etc) is
+            # exactly as "mic_listen failed" to the caller as a recording
+            # failure -- run_voice_turn already knows how to react to that
+            # prefix with a friendly fallback instead of silently crashing.
+            return f"mic_listen failed: transcription error: {e}"
+        finally:
+            Path(rec_path).unlink(missing_ok=True)
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def remember(key: str, value: str) -> str:
@@ -146,24 +237,26 @@ def _require_termux(tool_name: str) -> str | None:
 def set_alarm(hour: int, minute: int, label: str = "") -> str:
     """Set a real system alarm via the phone's clock app (not a cron job --
     this survives even if Termux itself gets killed in the background).
+
+    Routed through the Flutter app's own SET_ALARM intent (see
+    bridge_server.dart's /alarm + MainActivity.kt) rather than firing it
+    from Termux directly, because Termux's manifest doesn't declare the
+    com.android.alarm.permission.SET_ALARM permission at all -- there's
+    nothing for `pm grant` to grant (confirmed: a direct `am start` attempt
+    gets a SecurityException naming that exact missing permission). The
+    Flutter app declares it for itself instead (see GitHub issue #12).
     """
-    if (err := _require_termux("set_alarm")) is not None:
-        return err
     try:
-        subprocess.run(
-            [
-                "am", "start", "-a", "android.intent.action.SET_ALARM",
-                "--ei", "android.intent.extra.alarm.HOUR", str(int(hour)),
-                "--ei", "android.intent.extra.alarm.MINUTES", str(int(minute)),
-                "--es", "android.intent.extra.alarm.MESSAGE", label,
-                "--ez", "android.intent.extra.alarm.SKIP_UI", "true",
-            ],
-            check=True, capture_output=True, text=True, timeout=10,
+        resp = requests.post(
+            f"{BRIDGE_BASE}/alarm",
+            json={"hour": int(hour), "minute": int(minute), "label": label},
+            timeout=10,
         )
+        resp.raise_for_status()
         suffix = f" ({label})" if label else ""
         return f"Alarm set for {hour:02d}:{minute:02d}{suffix}"
     except Exception as e:
-        return f"Failed to set alarm: {e}"
+        return f"set_alarm failed: could not reach the app's alarm bridge ({e})"
 
 
 _CRON_FIELD_RE = re.compile(r"^[0-9*/,-]+$")
@@ -222,7 +315,9 @@ def open_app(uri: str) -> str:
         return f"Failed to open '{uri}': {e}"
 
 
-_MEDIA_KEYCODES = {"play_pause": "85", "next": "87", "previous": "88"}
+_MEDIA_ACTIONS = {"play_pause", "next", "previous"}
+
+BRIDGE_BASE = "http://127.0.0.1:8099"
 
 
 def media_control(action: str) -> str:
@@ -230,27 +325,230 @@ def media_control(action: str) -> str:
     currently playing audio (Spotify, YouTube Music, etc) -- generic control
     with no per-app API or login needed.
 
-    Note: on a non-rooted phone, `input keyevent` may fail with a permission
-    error unless the device has granted Termux the INJECT_EVENTS permission
-    (one-time `adb shell pm grant com.termux android.permission.INJECT_EVENTS`
-    from a PC). If that's not set up, this tool will return a clear error
-    rather than silently doing nothing.
+    Routed through the Flutter app's own AudioManager.dispatchMediaKeyEvent
+    (see bridge_server.dart's /media + MainActivity.kt) rather than Termux's
+    `input keyevent`, because that needs the signature-level INJECT_EVENTS
+    permission, which isn't grantable to a third-party app like Termux on
+    this Android version at all (confirmed: `pm grant` itself refuses it --
+    see GitHub issue #10). The Flutter app doesn't need any special
+    permission for this API, since it's the same mechanism a Bluetooth
+    headset's media button uses.
     """
-    if (err := _require_termux("media_control")) is not None:
-        return err
-    code = _MEDIA_KEYCODES.get(action)
-    if code is None:
-        return f"Unknown media action '{action}'. Use one of: {', '.join(_MEDIA_KEYCODES)}."
+    if action not in _MEDIA_ACTIONS:
+        return f"Unknown media action '{action}'. Use one of: {', '.join(_MEDIA_ACTIONS)}."
     try:
-        subprocess.run(
-            ["input", "keyevent", code], check=True, capture_output=True, text=True, timeout=10
-        )
+        resp = requests.post(f"{BRIDGE_BASE}/media", json={"action": action}, timeout=10)
+        resp.raise_for_status()
         return f"Sent media action: {action}"
     except Exception as e:
-        return f"Failed to send media action (device may need INJECT_EVENTS permission): {e}"
+        return f"media_control failed: could not reach the app's media bridge ({e})"
 
 
-BRIDGE_BASE = "http://127.0.0.1:8099"
+def open_app_by_name(name: str) -> str:
+    """Launch an installed app by its name (e.g. 'Spotify', 'Instagram',
+    'Chrome') -- unlike open_app, which needs a specific URI scheme, this
+    just matches against the names of apps actually installed on the phone.
+    """
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/app/open", json={"name": name}, timeout=10)
+        resp.raise_for_status()
+        if resp.json().get("ok"):
+            return f"Opened {name}."
+        return f"Couldn't find an installed app matching '{name}'."
+    except Exception as e:
+        return f"open_app_by_name failed: could not reach the app bridge ({e})"
+
+
+_SCREEN_ACTIONS = {"back", "home", "recents", "notifications"}
+
+
+def _accessibility_enabled() -> bool:
+    try:
+        resp = requests.get(f"{BRIDGE_BASE}/accessibility/status", timeout=5)
+        resp.raise_for_status()
+        return bool(resp.json().get("enabled"))
+    except Exception:
+        return False
+
+
+_ACCESSIBILITY_HINT = (
+    "Accessibility access isn't enabled yet. Ask the person to open WALL-E's "
+    "accessibility settings (call request_accessibility_access) and turn on "
+    "the WALL-E service -- this can't be granted automatically, Android "
+    "requires a manual tap for a permission this powerful."
+)
+
+
+def request_accessibility_access() -> str:
+    """Opens Android's Accessibility settings screen so the person can
+    enable WALL-E's accessibility service -- required once before
+    control_screen/read_screen/tap_screen_text will work. Can't be granted
+    automatically; this is a deliberately manual step for a permission this
+    powerful (system-wide screen reading + gesture injection).
+    """
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/accessibility/request", timeout=10)
+        resp.raise_for_status()
+        return (
+            "Opened Accessibility settings. Find 'WALL-E' in the list and turn "
+            "it on, then let me know."
+        )
+    except Exception as e:
+        return f"request_accessibility_access failed: could not reach the app bridge ({e})"
+
+
+def read_screen() -> str:
+    """Read the text currently visible on screen (whatever app is in the
+    foreground, not just WALL-E's own eyes) -- use this to see what's there
+    before tapping or scrolling, rather than guessing blind.
+    """
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    try:
+        resp = requests.get(f"{BRIDGE_BASE}/screen/text", timeout=10)
+        resp.raise_for_status()
+        return resp.text.strip() or "(nothing readable on screen right now)"
+    except Exception as e:
+        return f"read_screen failed: could not reach the app bridge ({e})"
+
+
+def tap_screen_text(text: str) -> str:
+    """Find the first visible element containing `text` (case-insensitive)
+    and tap it -- the reliable way to interact with an app: read_screen
+    first to see what's actually there, then tap by the text you saw.
+    """
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/screen/tap_text", json={"text": text}, timeout=10)
+        resp.raise_for_status()
+        if resp.json().get("ok"):
+            return f"Tapped '{text}'."
+        return f"Couldn't find anything matching '{text}' on screen."
+    except Exception as e:
+        return f"tap_screen_text failed: could not reach the app bridge ({e})"
+
+
+def control_screen(action: str) -> str:
+    """Send a system-level screen action: 'back', 'home', 'recents', or
+    'notifications' (opens the notification shade). For scrolling, use
+    scroll_screen instead.
+    """
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    if action not in _SCREEN_ACTIONS:
+        return f"Unknown screen action '{action}'. Use one of: {', '.join(_SCREEN_ACTIONS)}."
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/screen/action", json={"action": action}, timeout=10)
+        resp.raise_for_status()
+        if resp.json().get("ok"):
+            return f"Sent screen action: {action}"
+        return f"Screen action '{action}' didn't go through."
+    except Exception as e:
+        return f"control_screen failed: could not reach the app bridge ({e})"
+
+
+_SCROLL_SWIPES = {
+    # (x1, y1, x2, y2) as fractions of the screen -- a scroll "down" means
+    # the content moves up, so the swipe itself goes from low to high y.
+    "up": (0.5, 0.3, 0.5, 0.75),
+    "down": (0.5, 0.75, 0.5, 0.3),
+    "left": (0.75, 0.5, 0.25, 0.5),
+    "right": (0.25, 0.5, 0.75, 0.5),
+}
+
+
+def scroll_screen(direction: str) -> str:
+    """Scroll the current screen 'up', 'down', 'left', or 'right'."""
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    swipe = _SCROLL_SWIPES.get(direction)
+    if swipe is None:
+        return f"Unknown scroll direction '{direction}'. Use one of: {', '.join(_SCROLL_SWIPES)}."
+    x1, y1, x2, y2 = swipe
+    try:
+        resp = requests.post(
+            f"{BRIDGE_BASE}/screen/gesture",
+            json={"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration_ms": 300},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return f"Scrolled {direction}." if resp.json().get("ok") else f"Scroll {direction} didn't go through."
+    except Exception as e:
+        return f"scroll_screen failed: could not reach the app bridge ({e})"
+
+
+def tap_screen_at(x: float, y: float) -> str:
+    """Tap the screen at a specific point, as fractions of the screen size
+    (0.0-1.0 for both x and y, e.g. x=0.5, y=0.5 is dead center). Prefer
+    tap_screen_text when you can read what you want to tap instead."""
+    if not _accessibility_enabled():
+        return _ACCESSIBILITY_HINT
+    try:
+        resp = requests.post(
+            f"{BRIDGE_BASE}/screen/gesture", json={"x1": x, "y1": y}, timeout=10
+        )
+        resp.raise_for_status()
+        return f"Tapped ({x}, {y})." if resp.json().get("ok") else "Tap didn't go through."
+    except Exception as e:
+        return f"tap_screen_at failed: could not reach the app bridge ({e})"
+
+
+def _overlay_enabled() -> bool:
+    try:
+        resp = requests.get(f"{BRIDGE_BASE}/overlay/status", timeout=5)
+        resp.raise_for_status()
+        return bool(resp.json().get("permission_granted"))
+    except Exception:
+        return False
+
+
+_OVERLAY_HINT = (
+    "Overlay access isn't enabled yet. Call request_floating_overlay_access "
+    "so the person can turn on 'display over other apps' -- this can't be "
+    "granted automatically."
+)
+
+
+def request_floating_overlay_access() -> str:
+    """Opens the 'display over other apps' permission screen -- required
+    once before show_floating_overlay will work. Can't be granted
+    automatically, same reasoning as request_accessibility_access.
+    """
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/overlay/request", timeout=10)
+        resp.raise_for_status()
+        return (
+            "Opened the overlay permission screen. Find WALL-E and turn on "
+            "'Allow display over other apps', then let me know."
+        )
+    except Exception as e:
+        return f"request_floating_overlay_access failed: could not reach the app bridge ({e})"
+
+
+def show_floating_overlay() -> str:
+    """Show a small persistent floating bubble (mood-reactive, draggable,
+    tap to start a voice turn) that stays visible over whatever app is in
+    the foreground -- not just while WALL-E's own eyes screen is open.
+    """
+    if not _overlay_enabled():
+        return _OVERLAY_HINT
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/overlay/show", timeout=10)
+        resp.raise_for_status()
+        return "Floating bubble is up -- drag it anywhere, tap it to talk to me."
+    except Exception as e:
+        return f"show_floating_overlay failed: could not reach the app bridge ({e})"
+
+
+def hide_floating_overlay() -> str:
+    """Hide the floating bubble shown by show_floating_overlay."""
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/overlay/hide", timeout=10)
+        resp.raise_for_status()
+        return "Floating bubble hidden."
+    except Exception as e:
+        return f"hide_floating_overlay failed: could not reach the app bridge ({e})"
 
 
 def analyze_photo(prompt: str) -> str:
@@ -263,15 +561,19 @@ def analyze_photo(prompt: str) -> str:
     install. Being loopback-only, this also works regardless of any
     network-level isolation (e.g. mobile hotspot client isolation).
     """
+    mood_bridge.set_mood("taking_photo")
     try:
-        resp = requests.get(f"{BRIDGE_BASE}/photo", timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        return f"analyze_photo failed: could not reach the app's camera bridge ({e})"
+        try:
+            resp = requests.get(f"{BRIDGE_BASE}/photo", timeout=15)
+            resp.raise_for_status()
+        except Exception as e:
+            return f"analyze_photo failed: could not reach the app's camera bridge ({e})"
 
-    photo_path = str(Path(tempfile.gettempdir()) / f"walle_photo_{int(time.time())}.jpg")
-    Path(photo_path).write_bytes(resp.content)
-    return vision.analyze(photo_path, prompt)
+        photo_path = str(Path(tempfile.gettempdir()) / f"walle_photo_{int(time.time())}.jpg")
+        Path(photo_path).write_bytes(resp.content)
+        return vision.analyze(photo_path, prompt)
+    finally:
+        mood_bridge.set_mood("idle")
 
 
 def get_location() -> str:
@@ -336,6 +638,16 @@ REGISTRY = {
     "analyze_photo": analyze_photo,
     "get_location": get_location,
     "get_weather": get_weather,
+    "open_app_by_name": open_app_by_name,
+    "request_accessibility_access": request_accessibility_access,
+    "read_screen": read_screen,
+    "tap_screen_text": tap_screen_text,
+    "tap_screen_at": tap_screen_at,
+    "scroll_screen": scroll_screen,
+    "control_screen": control_screen,
+    "request_floating_overlay_access": request_floating_overlay_access,
+    "show_floating_overlay": show_floating_overlay,
+    "hide_floating_overlay": hide_floating_overlay,
 }
 
 # Descriptions injected into the system prompt so the model knows what it can do.
@@ -346,7 +658,8 @@ Use this for anything involving files, system info, or automating tasks.
 - remember(key: str, value: str): Save a fact for later, e.g. a user preference.
 - recall(query: str): Look up previously remembered facts matching a query.
 - speak(text: str): Say something out loud through the phone's speaker.
-- mic_listen(seconds: int): Record from the microphone and transcribe what was said.
+- mic_listen(): Record from the microphone and transcribe what was said -- \
+automatically stops once you stop hearing speech, no need to guess a duration.
 - set_alarm(hour: int, minute: int, label: str): Set a real system alarm.
 - schedule_reminder(cron_expr: str, message: str): Schedule a recurring notification (cron syntax).
 - open_app(uri: str): Open an app or URL via an Android intent (e.g. a Spotify link).
@@ -356,4 +669,17 @@ Use this for anything involving files, system info, or automating tasks.
 - analyze_photo(prompt: str): Take a photo with the camera and ask a question about what it shows.
 - get_location(): Get the phone's current GPS location as JSON (lat/lon/accuracy).
 - get_weather(latitude: float, longitude: float): Get current weather for a location.
+- open_app_by_name(name: str): Launch an installed app by its name (e.g. "Spotify").
+- request_accessibility_access(): Open settings so the person can enable screen control \
+(needed once before read_screen/tap_screen_text/tap_screen_at/scroll_screen/control_screen work).
+- read_screen(): Read the text currently visible on screen, in whatever app is in the foreground.
+- tap_screen_text(text: str): Find and tap the first on-screen element matching this text.
+- tap_screen_at(x: float, y: float): Tap a specific point (fractions 0.0-1.0 of the screen).
+- scroll_screen(direction: str): Scroll the screen "up", "down", "left", or "right".
+- control_screen(action: str): Send "back", "home", "recents", or "notifications".
+- request_floating_overlay_access(): Open settings so the person can enable the floating \
+bubble (needed once before show_floating_overlay works).
+- show_floating_overlay(): Show a small persistent mood-reactive bubble that stays visible \
+over any app, not just WALL-E's own screen -- drag it anywhere, tap it to start a voice turn.
+- hide_floating_overlay(): Hide the floating bubble.
 """

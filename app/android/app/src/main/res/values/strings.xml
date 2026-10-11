@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">Lets WALL-E open apps, scroll, tap, and read what\'s on screen when you ask it to.</string>
+</resources>

@@ -12,11 +12,17 @@ from pathlib import Path
 SETTINGS_PATH = Path(__file__).parent / "settings.json"
 
 DEFAULTS = {
-    "llm_provider": "gemini",       # "gemini" or "nemotron"
+    "llm_provider": "groq",         # "groq" (falls back to Gemini automatically), "gemini", or "nemotron"
     "llm_api_key": "",
     "llm_model": "",                # empty = use the provider's own default
-    "voice_provider": "gemini",     # only gemini supported for now
-    "voice_api_key": "",
+    "groq_api_key": "",             # Groq's free, fast inference API -- primary reasoning model
+    "voice_provider": "gemini",     # unused now -- kept so old settings.json files still load
+    "voice_api_key": "",            # Gemini key -- used for vision, Groq's fallback, and Gemini-fallback STT/TTS
+    "stt_provider": "gradium",      # STT: "gradium" or "gemini"
+    "tts_provider": "gradium",      # TTS: "gradium" or "gemini"
+    "gradium_api_key": "",          # one key covers both Gradium STT and TTS (shared credit pool)
+    "tts_voice_id": "NbpkqMVS3CJeq2j8",  # Gradium's "Zoey" (US, conversational)
+    "firecrawl_api_key": "",        # real web_search results (see GitHub issue #11); falls back to DDG if empty
 }
 
 

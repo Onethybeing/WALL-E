@@ -1,6 +1,19 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- For set_alarm (brain/tools.py): Termux's own manifest doesn't
+         declare this at all, so routing through the Flutter app's own
+         SET_ALARM intent is the only way to make this tool actually work
+         (see GitHub issue #12). -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+    <!-- Required on targetSdk 34+ for the overlay's specialUse foreground
+         service type (confirmed via crash log): declaring
+         foregroundServiceType="specialUse" without this permission throws
+         SecurityException at Service.startForeground(), crashing the app
+         the instant show_floating_overlay() is called. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <application
         android:label="WALL-E"
         android:name="${applicationName}"
@@ -32,6 +45,41 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+        <!-- Powers control_screen/read_screen (brain/tools.py): see
+             WallEAccessibilityService.kt's doc comment. Requires the
+             person to approve it manually in Settings > Accessibility;
+             cannot be silently granted like a normal permission. -->
+        <service
+            android:name=".WallEAccessibilityService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Powers show_floating_overlay (brain/tools.py). The
+             flutter_overlay_window package's own AndroidManifest.xml never
+             actually declares this service (confirmed by reading its
+             source), so Gradle's manifest merger has nothing to merge:
+             the library itself never declared it, so Android had nothing
+             to start when FlutterOverlayWindowPlugin.java called
+             context.startService(new Intent(context, OverlayService.class)).
+             That's very likely why showOverlay() reported success (the
+             method channel call itself succeeds) while nothing ever
+             rendered. Declaring it here ourselves is the fix. -->
+        <service
+            android:name="flutter.overlay.window.flutter_overlay_window.OverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="overlay_window_service" />
+        </service>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
@@ -42,6 +90,17 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Required for speech_to_text (wake_word.dart): without this,
+             Android 11+'s package-visibility rules hide the Google app's
+             speech recognizer from PackageManager entirely, which
+             SpeechRecognizer surfaces as a generic error_client rather
+             than any permission-sounding error (confirmed live: every
+             listen attempt failed this way until this was added, with
+             RECORD_AUDIO already granted). Matches speech_to_text's own
+             example app's manifest exactly. -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
         </intent>
     </queries>
 </manifest>

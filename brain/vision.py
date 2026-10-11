@@ -44,6 +44,7 @@ def analyze(image_path: str, prompt: str) -> str:
         },
         timeout=30,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text}")
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()

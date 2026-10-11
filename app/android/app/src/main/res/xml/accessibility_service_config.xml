@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Config for WallEAccessibilityService.kt: powers the "control apps and
+  scroll on my phone" tools (brain/tools.py's control_screen/read_screen).
+  canPerformGestures lets it tap/swipe anywhere on screen; canRetrieveWindowContent
+  lets it read what's actually on screen (read_screen) so the agent can act
+  on real content instead of guessing coordinates blind.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="100" />

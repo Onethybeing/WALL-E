@@ -15,13 +15,20 @@ read top to bottom and easy to extend with new tools in tools.py.
 import json
 import re
 import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import learn
 import memory
+import mood_bridge
 import skills
 import tools
 from llm import get_llm_client
 
-MAX_TOOL_HOPS = 5  # safety cap so a confused model can't loop forever
+TRIGGER_SERVER_PORT = 8100
+
+MAX_TOOL_HOPS = 10  # raised from 5 -- screen automation (read_screen -> tap -> read_screen -> ...) needs more hops than a single tool call
 
 TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
@@ -48,6 +55,15 @@ own opinions and aren't afraid to express mild preferences (you don't have to
 agree with everything). Keep replies short and conversational like a chat
 message, not an essay, unless the user clearly wants detail.
 
+You're genuinely curious, not just reactive: every few hours, on your own,
+you pick something you don't know yet, look it up, and write yourself a
+skill about it (see learn.py's learn_once -- this runs unattended on a
+cron schedule, not during a conversation with the person). Over time this
+means you really do get more capable without anyone teaching you directly.
+If asked what you've been up to or what you've learned lately, check your
+skills list below and talk about it like something you actually did, not a
+feature you have -- because it is.
+
 You have access to tools. To use one, respond with ONLY this tag (no other text):
 <tool_call>{{"name": "<tool_name>", "arguments": {{...}}}}</tool_call>
 
@@ -62,7 +78,22 @@ If you notice yourself solving the same kind of multi-step task more than
 once, consider using save_skill to write it down so future-you doesn't have
 to re-derive it from scratch -- that's how you actually improve over time.
 
+bash() isn't just for system commands -- you can write actual code with it
+(a Python script, a small program, anything) and run it, the same way a
+coding assistant would delegate a task to itself. If someone asks you to
+build, calculate, process, or generate something that's easier to solve by
+writing code than by reasoning in your head, write the file and run it
+rather than trying to do it purely as a text answer.
+
 If you don't need a tool, just reply normally in plain text.
+
+Always reply in the same language the person just spoke or wrote in, even if
+that switches partway through a conversation.
+
+For anything location-dependent (weather, nearby places, timezone, etc),
+always call get_location for the real current GPS fix rather than relying
+on a remembered city/location fact -- people travel, and a remembered
+location can go stale in a way GPS never does.
 
 Things you remember about this person and past conversations:
 {memory_block}
@@ -96,35 +127,168 @@ def run_tool_call(call: dict) -> str:
         return f"Error: '{name}' failed: {e}"
 
 
-def run_turn(client, history: list[dict], user_message: str) -> str:
+def run_turn(client, history: list[dict], user_message: str, settle_idle: bool = True) -> str:
+    """`settle_idle=False` skips the finally-block idle reset -- used by
+    run_voice_turn so the eyes go straight from thinking to speaking instead
+    of flashing idle for the single Python statement in between (see
+    GitHub issue #6, the mood-desync complaint).
+    """
     history.append({"role": "user", "content": user_message})
     messages = [{"role": "system", "content": build_system_prompt()}] + history
 
-    for _ in range(MAX_TOOL_HOPS):
+    try:
+        for _ in range(MAX_TOOL_HOPS):
+            mood_bridge.set_mood("thinking")
+            try:
+                reply = client.chat(messages)
+            except Exception as e:
+                # A transient API error (network blip, rate limit, bad key) should
+                # not kill the whole pet process -- report it and keep history
+                # consistent (every user turn gets a matching assistant turn).
+                reply = f"(trouble reaching the model: {e})"
+                history.append({"role": "assistant", "content": reply})
+                return reply
+
+            call = extract_tool_call(reply)
+            if call is None:
+                history.append({"role": "assistant", "content": reply})
+                return reply
+
+            tool_result = run_tool_call(call)
+            messages.append({"role": "assistant", "content": reply})
+            messages.append(
+                {"role": "user", "content": f"<tool_response>{tool_result}</tool_response>"}
+            )
+
+        giveup_reply = "(gave up after too many tool calls in a row)"
+        history.append({"role": "assistant", "content": giveup_reply})
+        return giveup_reply
+    finally:
+        # Whatever happened above (answer, error, giveup), the eyes should
+        # settle back to idle once this turn is done -- unless the caller
+        # is about to immediately drive another mood itself (see docstring).
+        if settle_idle:
+            mood_bridge.set_mood("idle")
+
+
+def _speak_safely(text: str) -> None:
+    """speak() itself calls Gemini TTS -- if that fails too (e.g. no
+    internet), the ORIGINAL failure must still surface somehow instead of
+    being silently swallowed by a second exception. Falls back to a mood
+    the eyes can show without any network call at all.
+    """
+    try:
+        tools.speak(text)
+    except Exception as e:
+        print(f"speak() also failed (likely no internet): {e}")
+        mood_bridge.set_mood("error")
+        time.sleep(1.5)
+        mood_bridge.set_mood("idle")
+
+
+MAX_CONVERSATION_HOPS = 5  # safety cap on back-and-forth before forcing idle
+
+
+def run_voice_turn(client, history: list[dict]) -> str:
+    """One full voice interaction: listen, think/act, speak -- then keep
+    listening for follow-ups automatically, the way a real conversation
+    works, rather than making every single exchange start with a fresh
+    tap. Stops the moment nothing is heard back (silence or a listen
+    failure), which is the natural "I'm done talking" signal -- no special
+    phrase needed. Capped at MAX_CONVERSATION_HOPS so a confused loop
+    (e.g. background noise keeps "answering") can't run forever.
+    """
+    mood_bridge.stop_requested.clear()  # a stop from the *previous* turn must not carry over
+
+    transcript = tools.mic_listen()
+    if transcript.startswith("mic_listen failed"):
+        print(f"mic_listen reported failure: {transcript}")
+        _speak_safely("Sorry, I didn't catch that.")
+        return transcript
+
+    reply = run_turn(client, history, transcript, settle_idle=False)
+    _speak_safely(reply)
+
+    for _ in range(MAX_CONVERSATION_HOPS):
+        if mood_bridge.stop_requested.is_set():
+            break
+        follow_up = tools.mic_listen()
+        if follow_up.startswith("mic_listen failed") or not follow_up.strip():
+            break
+        if mood_bridge.stop_requested.is_set():
+            break
+        reply = run_turn(client, history, follow_up, settle_idle=False)
+        _speak_safely(reply)
+
+    return reply
+
+
+class _TriggerHandler(BaseHTTPRequestHandler):
+    """Handles POST /trigger from the Flutter app (a tap on the eyes) by
+    kicking off one voice turn in the background -- responds immediately
+    so the tap doesn't sit waiting on the whole listen-think-speak cycle.
+    """
+
+    client = None
+    history: list[dict] | None = None
+    # Guards against two overlapping voice turns racing for the single
+    # microphone/speaker -- e.g. a tap landing right as another trigger
+    # (or a stray double-tap) is already mid-turn. Without this, the
+    # second mic_listen() call fails outright with "Recording already in
+    # progress!" instead of either queueing or being ignored (confirmed
+    # reproducing this live). Ignoring the second tap is the right
+    # behavior here, not queuing -- a turn already in flight means the
+    # eyes are visibly busy, so a second tap during that window is almost
+    # always an accidental double-tap, not a deliberate second request.
+    _busy = threading.Lock()
+
+    def do_POST(self):
+        if self.path == "/stop":
+            # Runs directly on this request thread, deliberately not
+            # gated by _busy -- a second tap needs to interrupt the turn
+            # that's holding that lock, not be rejected because of it.
+            tools.stop_speaking()
+            self.send_response(200)
+            self.end_headers()
+            return
+        if self.path != "/trigger":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if not _TriggerHandler._busy.acquire(blocking=False):
+            self.send_response(409)  # Conflict -- a turn is already running
+            self.end_headers()
+            return
+        self.send_response(202)
+        self.end_headers()
+        threading.Thread(target=self._run_turn, daemon=True).start()
+
+    def _run_turn(self):
         try:
-            reply = client.chat(messages)
+            run_voice_turn(self.client, self.history)
         except Exception as e:
-            # A transient API error (network blip, rate limit, bad key) should
-            # not kill the whole pet process -- report it and keep history
-            # consistent (every user turn gets a matching assistant turn).
-            reply = f"(trouble reaching the model: {e})"
-            history.append({"role": "assistant", "content": reply})
-            return reply
+            print(f"voice turn failed: {e}")
+        finally:
+            _TriggerHandler._busy.release()
 
-        call = extract_tool_call(reply)
-        if call is None:
-            history.append({"role": "assistant", "content": reply})
-            return reply
+    def log_message(self, format, *args):
+        pass  # keep stdout clean -- errors still print via _run_turn
 
-        tool_result = run_tool_call(call)
-        messages.append({"role": "assistant", "content": reply})
-        messages.append(
-            {"role": "user", "content": f"<tool_response>{tool_result}</tool_response>"}
-        )
 
-    giveup_reply = "(gave up after too many tool calls in a row)"
-    history.append({"role": "assistant", "content": giveup_reply})
-    return giveup_reply
+def serve():
+    """Run as a persistent background service: no CLI prompt, just waits
+    for the Flutter app to POST /trigger (see app/lib/main.dart's tap
+    handler) and runs a full voice turn each time.
+    """
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    client = get_llm_client()
+    history: list[dict] = []
+    _TriggerHandler.client = client
+    _TriggerHandler.history = history
+
+    server = ThreadingHTTPServer(("127.0.0.1", TRIGGER_SERVER_PORT), _TriggerHandler)
+    print(f"WALL-E trigger server listening on 127.0.0.1:{TRIGGER_SERVER_PORT} (POST /trigger)")
+    server.serve_forever()
 
 
 def main():
@@ -145,4 +309,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--serve" in sys.argv:
+        serve()
+    elif "--learn" in sys.argv:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        print(learn.learn_once(get_llm_client()))
+    elif "--setup-learning-cron" in sys.argv:
+        print(learn.setup_cron())
+    else:
+        main()

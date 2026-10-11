@@ -47,6 +47,10 @@ class GeminiClient:
             json=payload,
             timeout=60,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            # requests' default HTTPError discards the response body, which
+            # for a 400 is almost always the one piece of info that explains
+            # *why* -- surface it instead of a bare "400 Client Error".
+            raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text}")
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]

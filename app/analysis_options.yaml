@@ -18,6 +18,12 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
+    # Wake-word is disabled (see main.dart's commented-out import) because
+    # sherpa-onnx's keyword spotter crashes natively on real hardware --
+    # this file's implementation is kept for a future retry, but its
+    # dependencies (sherpa_onnx, record, path_provider) are intentionally
+    # commented out of pubspec.yaml, so it can't resolve imports right now.
+    - lib/wake_word.dart
 
 linter:
   # The lint rules applied to this project can be customized in the
