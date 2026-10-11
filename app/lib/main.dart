@@ -9,16 +9,12 @@ import 'package:rive/rive.dart' hide RadialGradient;
 import 'bridge_server.dart';
 import 'face_tracking.dart';
 import 'rive_eyes.dart';
-// Wake-word is temporarily disabled -- sherpa-onnx's keyword spotter
-// crashes natively (Ort::Exception in the encoder's Reshape node, Fatal
-// signal 6/SIGABRT) with this exact kws-zipformer-gigaspeech model on real
-// hardware, reproducibly, regardless of audio chunk size fed to it. Verified
-// the model files match the official release and the Dart-side config
-// matches sherpa-onnx's own reference example -- this looks like a genuine
-// upstream incompatibility between sherpa_onnx 1.13.8's bundled ONNX
-// Runtime and this model's exported graph, not a bug in our integration
-// code. See wake_word.dart for the full (otherwise working) implementation.
-// import 'wake_word.dart';
+// Wake-word: sherpa-onnx's keyword spotter crashed natively (Ort::Exception
+// in the encoder's Reshape node, Fatal signal 6/SIGABRT) and Porcupine's
+// plugin still hardcodes a conflicting compileSdkVersion -- both dropped.
+// wake_word.dart now uses speech_to_text (Android's own SpeechRecognizer)
+// instead, which has neither problem. See that file's doc comment.
+import 'wake_word.dart';
 
 /// Entry point for the persistent "Dynamic Island"-style overlay -- a
 /// second, independent FlutterEngine the OS renders on top of whatever app
@@ -375,7 +371,12 @@ class _EyesScreenState extends State<EyesScreen>
 
   final BridgeServer _bridgeServer = BridgeServer();
 
-  // WakeWordListener? _wakeWordListener; // disabled -- see import comment above
+  WakeWordListener? _wakeWordListener;
+  // True from the moment the brain leaves "idle" until it returns to it --
+  // tracks whether the wake-word listener needs resuming once the current
+  // voice turn (which may hop through several listen/think/speak rounds)
+  // is genuinely finished, not just between hops.
+  bool _voiceTurnInProgress = false;
 
   final Random _random = Random();
 
@@ -392,13 +393,38 @@ class _EyesScreenState extends State<EyesScreen>
     _bridgeServer.resumeFaceCamera = () async => _faceTracker?.start();
     _bridgeServer.start();
     _bridgeServer.moodNotifier.addListener(_onBrainMoodChanged);
-    // Wake-word setup disabled for now -- see import comment above.
+    if (WakeWordListener.isSupported) {
+      _wakeWordListener = WakeWordListener(onWake: _onWakeWordDetected);
+      _wakeWordListener!.start();
+    }
+  }
+
+  /// Only fires a voice turn if the pet is genuinely idle -- a stray match
+  /// against TTS audio bleeding back into the mic, or a wake phrase heard
+  /// mid-turn, should not interrupt or double-trigger a turn already in
+  /// flight.
+  void _onWakeWordDetected() {
+    if (_mood == Mood.idle) {
+      _triggerVoiceTurn();
+    }
   }
 
   void _onBrainMoodChanged() {
     final mood = _moodFromBrainState(_bridgeServer.moodNotifier.value);
     if (mood != null && mounted) {
       setState(() => _mood = mood);
+    }
+    if (mood == Mood.idle) {
+      if (_voiceTurnInProgress) {
+        _voiceTurnInProgress = false;
+        // speech_to_text's own SpeechRecognizer can't share the mic with
+        // the raw recorder mic_listen() just used -- only safe to resume
+        // listening for the wake word once the brain is truly done, not
+        // between the conversational hops within a single turn.
+        _wakeWordListener?.resume();
+      }
+    } else {
+      _voiceTurnInProgress = true;
     }
     // Forward to the floating overlay too, if it's up -- it runs in a
     // completely separate isolate/engine with no access to this
@@ -466,6 +492,22 @@ class _EyesScreenState extends State<EyesScreen>
       _bridgeServer.stopListening();
       return;
     }
+    if (_mood != Mood.idle) {
+      // Busy but not listening (thinking/searching/speaking) -- a tap here
+      // means "stop", same as tapping again while listening does. Hits
+      // agent.py's POST /stop, which kills audio playback immediately and
+      // cuts the rest of the turn short (see mood_bridge.stop_requested).
+      try {
+        final client = HttpClient();
+        final request = await client.postUrl(Uri.parse('http://127.0.0.1:8100/stop'));
+        await request.close();
+        client.close();
+      } catch (_) {}
+      return;
+    }
+    // Hand the mic over fully before the brain's own listen() call starts --
+    // Android can't run SpeechRecognizer and the raw-PCM recorder at once.
+    await _wakeWordListener?.pause();
     try {
       final client = HttpClient();
       final request = await client.postUrl(Uri.parse('http://127.0.0.1:8100/trigger'));
@@ -474,7 +516,10 @@ class _EyesScreenState extends State<EyesScreen>
     } catch (_) {
       // Brain's trigger server isn't running (e.g. agent.py --serve hasn't
       // been started in Termux yet) -- nothing to show the user for this,
-      // the eyes simply won't react, which is itself the signal.
+      // the eyes simply won't react, which is itself the signal. Since no
+      // turn actually started, mood will never come back around to "idle"
+      // to resume the wake-word listener -- undo the pause ourselves.
+      _wakeWordListener?.resume();
     }
   }
 
@@ -484,6 +529,7 @@ class _EyesScreenState extends State<EyesScreen>
     _faceTracker?.stop();
     _bridgeServer.moodNotifier.removeListener(_onBrainMoodChanged);
     _bridgeServer.stop();
+    _wakeWordListener?.stop();
     super.dispose();
   }
 

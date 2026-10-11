@@ -91,5 +91,16 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- Required for speech_to_text (wake_word.dart): without this,
+             Android 11+'s package-visibility rules hide the Google app's
+             speech recognizer from PackageManager entirely, which
+             SpeechRecognizer surfaces as a generic error_client rather
+             than any permission-sounding error (confirmed live: every
+             listen attempt failed this way until this was added, with
+             RECORD_AUDIO already granted). Matches speech_to_text's own
+             example app's manifest exactly. -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
     </queries>
 </manifest>

@@ -198,6 +198,8 @@ def run_voice_turn(client, history: list[dict]) -> str:
     phrase needed. Capped at MAX_CONVERSATION_HOPS so a confused loop
     (e.g. background noise keeps "answering") can't run forever.
     """
+    mood_bridge.stop_requested.clear()  # a stop from the *previous* turn must not carry over
+
     transcript = tools.mic_listen()
     if transcript.startswith("mic_listen failed"):
         print(f"mic_listen reported failure: {transcript}")
@@ -208,8 +210,12 @@ def run_voice_turn(client, history: list[dict]) -> str:
     _speak_safely(reply)
 
     for _ in range(MAX_CONVERSATION_HOPS):
+        if mood_bridge.stop_requested.is_set():
+            break
         follow_up = tools.mic_listen()
         if follow_up.startswith("mic_listen failed") or not follow_up.strip():
+            break
+        if mood_bridge.stop_requested.is_set():
             break
         reply = run_turn(client, history, follow_up, settle_idle=False)
         _speak_safely(reply)
@@ -237,6 +243,14 @@ class _TriggerHandler(BaseHTTPRequestHandler):
     _busy = threading.Lock()
 
     def do_POST(self):
+        if self.path == "/stop":
+            # Runs directly on this request thread, deliberately not
+            # gated by _busy -- a second tap needs to interrupt the turn
+            # that's holding that lock, not be rejected because of it.
+            tools.stop_speaking()
+            self.send_response(200)
+            self.end_headers()
+            return
         if self.path != "/trigger":
             self.send_response(404)
             self.end_headers()

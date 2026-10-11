@@ -134,10 +134,36 @@ def speak(text: str) -> str:
     try:
         out_path = str(Path(tempfile.gettempdir()) / f"walle_speak_{int(time.time())}.wav")
         voice.speak(text, out_path)
+        # A tap mid-turn (see agent.py's POST /stop) may have landed while
+        # synthesis was in flight -- don't start playing audio the person
+        # already asked to stop.
+        if mood_bridge.stop_requested.is_set():
+            return "(spoke, but playback skipped: stop requested)"
         _play_audio(out_path)
         return f"(spoke): {text}"
     finally:
         mood_bridge.set_mood("idle")
+
+
+def stop_speaking() -> str:
+    """Stop any audio currently playing and cut short the rest of the
+    current voice turn -- the brain-side half of a second tap on the eyes
+    while WALL-E is speaking or thinking (see main.dart's
+    _triggerVoiceTurn and agent.py's POST /stop). Runs on the trigger
+    server's own thread, not the turn's thread, so it works even while that
+    thread is stuck inside a blocking network call.
+    """
+    mood_bridge.stop_requested.set()
+    if platform.system() == "Windows":
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(New-Object -ComObject WMPlayer.OCX).controls.stop()"],
+            check=False,
+        )
+    else:
+        subprocess.run(["termux-media-player", "stop"], check=False)
+    mood_bridge.set_mood("idle")
+    return "(stopped)"
 
 
 def mic_listen(seconds: int | None = None) -> str:
