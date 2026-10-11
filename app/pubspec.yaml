@@ -59,6 +59,20 @@ dependencies:
   record: ^6.1.1
   path_provider: ^2.1.5
 
+  # Persistent "Dynamic Island"-style overlay -- stays visible system-wide,
+  # not just while the eyes screen is in the foreground. Renders a second,
+  # separate Flutter engine into an Android overlay window (SYSTEM_ALERT_WINDOW),
+  # which -- like the Accessibility Service -- can't be silently granted;
+  # the person has to approve "display over other apps" manually.
+  #
+  # NOTE: tried flutter_overlay_window_plus first -- its OverlayService.java
+  # turned out to be a plain native View/TextView overlay, not an actual
+  # Flutter engine, so overlayTitle/overlayContent are just text, not a
+  # real widget tree. flutter_overlay_window (no "_plus") is the original,
+  # genuinely renders a second FlutterEngine via the documented
+  # @pragma("vm:entry-point") entry point.
+  flutter_overlay_window: ^0.5.0
+
   # Wake-word is temporarily disabled -- see lib/main.dart's import comment
   # for why (sherpa-onnx's keyword spotter crashes natively, reproducibly,
   # on real hardware with this exact model -- an upstream incompatibility,

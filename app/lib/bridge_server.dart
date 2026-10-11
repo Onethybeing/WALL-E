@@ -8,6 +8,7 @@ import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:flutter/services.dart' show MethodChannel;
+import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:record/record.dart';
 
@@ -106,6 +107,14 @@ class BridgeServer {
         await _handleAccessibilityStatus(request);
       } else if (request.uri.path == '/accessibility/request' && request.method == 'POST') {
         await _handleAccessibilityRequest(request);
+      } else if (request.uri.path == '/overlay/show' && request.method == 'POST') {
+        await _handleOverlayShow(request);
+      } else if (request.uri.path == '/overlay/hide' && request.method == 'POST') {
+        await _handleOverlayHide(request);
+      } else if (request.uri.path == '/overlay/status') {
+        await _handleOverlayStatus(request);
+      } else if (request.uri.path == '/overlay/request' && request.method == 'POST') {
+        await _handleOverlayRequest(request);
       } else {
         request.response.statusCode = HttpStatus.notFound;
         await request.response.close();
@@ -263,6 +272,47 @@ class BridgeServer {
 
   Future<void> _handleAccessibilityRequest(HttpRequest request) async {
     await _platformChannel.invokeMethod('openAccessibilitySettings');
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
+  }
+
+  Future<void> _handleOverlayShow(HttpRequest request) async {
+    if (!await FlutterOverlayWindow.isPermissionGranted()) {
+      request.response.statusCode = HttpStatus.forbidden;
+      request.response.write('error: overlay permission not granted yet');
+      await request.response.close();
+      return;
+    }
+    await FlutterOverlayWindow.showOverlay(
+      height: 80,
+      width: 80,
+      alignment: OverlayAlignment.topRight,
+      flag: OverlayFlag.defaultFlag,
+      enableDrag: true,
+      positionGravity: PositionGravity.auto,
+      overlayTitle: "WALL-E",
+      overlayContent: "Tap to talk",
+    );
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
+  }
+
+  Future<void> _handleOverlayHide(HttpRequest request) async {
+    await FlutterOverlayWindow.closeOverlay();
+    request.response.statusCode = HttpStatus.ok;
+    await request.response.close();
+  }
+
+  Future<void> _handleOverlayStatus(HttpRequest request) async {
+    final granted = await FlutterOverlayWindow.isPermissionGranted();
+    final active = granted ? await FlutterOverlayWindow.isActive() : false;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode({'permission_granted': granted, 'active': active}));
+    await request.response.close();
+  }
+
+  Future<void> _handleOverlayRequest(HttpRequest request) async {
+    await FlutterOverlayWindow.requestPermission();
     request.response.statusCode = HttpStatus.ok;
     await request.response.close();
   }

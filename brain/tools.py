@@ -468,6 +468,63 @@ def tap_screen_at(x: float, y: float) -> str:
         return f"tap_screen_at failed: could not reach the app bridge ({e})"
 
 
+def _overlay_enabled() -> bool:
+    try:
+        resp = requests.get(f"{BRIDGE_BASE}/overlay/status", timeout=5)
+        resp.raise_for_status()
+        return bool(resp.json().get("permission_granted"))
+    except Exception:
+        return False
+
+
+_OVERLAY_HINT = (
+    "Overlay access isn't enabled yet. Call request_floating_overlay_access "
+    "so the person can turn on 'display over other apps' -- this can't be "
+    "granted automatically."
+)
+
+
+def request_floating_overlay_access() -> str:
+    """Opens the 'display over other apps' permission screen -- required
+    once before show_floating_overlay will work. Can't be granted
+    automatically, same reasoning as request_accessibility_access.
+    """
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/overlay/request", timeout=10)
+        resp.raise_for_status()
+        return (
+            "Opened the overlay permission screen. Find WALL-E and turn on "
+            "'Allow display over other apps', then let me know."
+        )
+    except Exception as e:
+        return f"request_floating_overlay_access failed: could not reach the app bridge ({e})"
+
+
+def show_floating_overlay() -> str:
+    """Show a small persistent floating bubble (mood-reactive, draggable,
+    tap to start a voice turn) that stays visible over whatever app is in
+    the foreground -- not just while WALL-E's own eyes screen is open.
+    """
+    if not _overlay_enabled():
+        return _OVERLAY_HINT
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/overlay/show", timeout=10)
+        resp.raise_for_status()
+        return "Floating bubble is up -- drag it anywhere, tap it to talk to me."
+    except Exception as e:
+        return f"show_floating_overlay failed: could not reach the app bridge ({e})"
+
+
+def hide_floating_overlay() -> str:
+    """Hide the floating bubble shown by show_floating_overlay."""
+    try:
+        resp = requests.post(f"{BRIDGE_BASE}/overlay/hide", timeout=10)
+        resp.raise_for_status()
+        return "Floating bubble hidden."
+    except Exception as e:
+        return f"hide_floating_overlay failed: could not reach the app bridge ({e})"
+
+
 def analyze_photo(prompt: str) -> str:
     """Take a photo with the phone's camera and ask a question about it,
     e.g. "what am I wearing" or "what does this room look like".
@@ -562,6 +619,9 @@ REGISTRY = {
     "tap_screen_at": tap_screen_at,
     "scroll_screen": scroll_screen,
     "control_screen": control_screen,
+    "request_floating_overlay_access": request_floating_overlay_access,
+    "show_floating_overlay": show_floating_overlay,
+    "hide_floating_overlay": hide_floating_overlay,
 }
 
 # Descriptions injected into the system prompt so the model knows what it can do.
@@ -591,4 +651,9 @@ automatically stops once you stop hearing speech, no need to guess a duration.
 - tap_screen_at(x: float, y: float): Tap a specific point (fractions 0.0-1.0 of the screen).
 - scroll_screen(direction: str): Scroll the screen "up", "down", "left", or "right".
 - control_screen(action: str): Send "back", "home", "recents", or "notifications".
+- request_floating_overlay_access(): Open settings so the person can enable the floating \
+bubble (needed once before show_floating_overlay works).
+- show_floating_overlay(): Show a small persistent mood-reactive bubble that stays visible \
+over any app, not just WALL-E's own screen -- drag it anywhere, tap it to start a voice turn.
+- hide_floating_overlay(): Hide the floating bubble.
 """

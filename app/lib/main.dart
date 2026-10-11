@@ -2,11 +2,18 @@ import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import 'package:rive/rive.dart' hide RadialGradient;
 
 import 'bridge_server.dart';
 import 'face_tracking.dart';
 import 'rive_eyes.dart';
+// Not called directly from here -- importing it is what keeps overlayMain()
+// (its @pragma("vm:entry-point") function) in the compiled app, since
+// flutter_overlay_window's native side looks it up by name at runtime. See
+// its doc comment for what it actually does.
+// ignore: unused_import
+import 'overlay_main.dart' as overlay;
 // Wake-word is temporarily disabled -- sherpa-onnx's keyword spotter
 // crashes natively (Ort::Exception in the encoder's Reshape node, Fatal
 // signal 6/SIGABRT) with this exact kws-zipformer-gigaspeech model on real
@@ -275,6 +282,12 @@ class _EyesScreenState extends State<EyesScreen>
     if (mood != null && mounted) {
       setState(() => _mood = mood);
     }
+    // Forward to the floating overlay too, if it's up -- it runs in a
+    // completely separate isolate/engine with no access to this
+    // ValueNotifier directly, so FlutterOverlayWindow.shareData is the
+    // only channel between them (overlay_main.dart listens on the other
+    // end). No-ops harmlessly if the overlay isn't currently showing.
+    FlutterOverlayWindow.shareData(_bridgeServer.moodNotifier.value);
   }
 
   void _setUpLookBehaviour() {
