@@ -8,6 +8,12 @@
          (see GitHub issue #12). -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+    <!-- Required on targetSdk 34+ for the overlay's specialUse foreground
+         service type (confirmed via crash log): declaring
+         foregroundServiceType="specialUse" without this permission throws
+         SecurityException at Service.startForeground(), crashing the app
+         the instant show_floating_overlay() is called. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <application
         android:label="WALL-E"
         android:name="${applicationName}"
@@ -54,6 +60,25 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Powers show_floating_overlay (brain/tools.py). The
+             flutter_overlay_window package's own AndroidManifest.xml never
+             actually declares this service (confirmed by reading its
+             source), so Gradle's manifest merger has nothing to merge:
+             the library itself never declared it, so Android had nothing
+             to start when FlutterOverlayWindowPlugin.java called
+             context.startService(new Intent(context, OverlayService.class)).
+             That's very likely why showOverlay() reported success (the
+             method channel call itself succeeds) while nothing ever
+             rendered. Declaring it here ourselves is the fix. -->
+        <service
+            android:name="flutter.overlay.window.flutter_overlay_window.OverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="overlay_window_service" />
         </service>
     </application>
     <!-- Required to query activities that can process text, see:

@@ -283,13 +283,27 @@ class BridgeServer {
       await request.response.close();
       return;
     }
+    // Confirmed via `adb shell dumpsys window windows`: with no explicit
+    // startPosition, the plugin defaults Y to -statusBarHeightPx() (see its
+    // OverlayService.java), which combined with alignment=topRight pushed
+    // the window to y=-191 on this device -- entirely off-screen above the
+    // visible area, while the method channel call itself still reported
+    // success (the window genuinely existed, just not visibly). Passing an
+    // explicit on-screen startPosition fixed that.
+    //
+    // Still invisible after that fix, though -- this device's navigation
+    // bar lives along the right edge of the screen in this landscape app
+    // (confirmed via screenshot), and an APPLICATION_OVERLAY-type window
+    // renders *behind* the system nav bar's higher z-order there. Using
+    // topLeft instead keeps it clear of that area.
     await FlutterOverlayWindow.showOverlay(
       height: 80,
       width: 80,
-      alignment: OverlayAlignment.topRight,
+      alignment: OverlayAlignment.topLeft,
       flag: OverlayFlag.defaultFlag,
       enableDrag: true,
       positionGravity: PositionGravity.auto,
+      startPosition: const OverlayPosition(20, 100),
       overlayTitle: "WALL-E",
       overlayContent: "Tap to talk",
     );

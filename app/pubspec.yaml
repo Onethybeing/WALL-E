@@ -73,12 +73,19 @@ dependencies:
   # @pragma("vm:entry-point") entry point.
   flutter_overlay_window: ^0.5.0
 
-  # Wake-word is temporarily disabled -- see lib/main.dart's import comment
-  # for why (sherpa-onnx's keyword spotter crashes natively, reproducibly,
-  # on real hardware with this exact model -- an upstream incompatibility,
-  # not a bug in our integration). Porcupine was tried before this and
-  # dropped for an unfixable compileSdk conflict. See lib/wake_word.dart for
-  # the full (otherwise working) sherpa-onnx implementation.
+  # Wake-word, take 3: sherpa-onnx's native keyword spotter crashed
+  # reproducibly (Ort::Exception reshape error, SIGABRT -- genuine
+  # model/runtime incompatibility, confirmed not fixable by adjusting our
+  # integration). Porcupine was tried next and dropped for a compileSdk 31
+  # conflict with camera/mlkit's AndroidX requirements -- re-checked its
+  # current GitHub source (Dec 2025 release) and it still hardcodes
+  # `compileSdkVersion 31`, so that's still blocked upstream, unfixed.
+  # speech_to_text wraps Android's own SpeechRecognizer -- no native model,
+  # no compileSdk conflict (just needs compileSdkVersion 31+, which this
+  # app already has). It doesn't support true continuous listening
+  # natively (its own docs say so), so wake_word.dart works around that
+  # with a restart-on-timeout loop instead -- see its doc comment.
+  speech_to_text: ^7.5.0
   # sherpa_onnx: ^1.13.8
   # path: ^1.9.1
 
